@@ -1,11 +1,12 @@
-# miri_rencontre.py — Miri Rencontre (full, interactions déférées partout)
+# miri_rencontre.py — Miri Rencontre (full, stable interactions + restore vues persistantes)
 # ✔ Bouton accueil → DM modal + photo (upload ou URL) → publication
 # ✔ Profils publics miniature gauche (thumbnail)
 # ✔ Boutons: ❤️ Like | ❌ Pass | 📩 Contacter | ✏️ Modifier | 🗑️ Supprimer
 # ✔ Like/Pass façon Tinder + détection de match (DM aux deux)
 # ✔ Logs détaillés [JJ/MM/AAAA HH:MM]
 # ✔ Aucune slash… sauf /speeddating (staff)
-# ✔ DEFER systématique sur callbacks de boutons (sauf ouverture de Modal)
+# ✔ DEFER sur callbacks (sauf ouverture de Modal)
+# ✔ 🔁 RÉATTACHEMENT des vues persistantes au démarrage (fini les “interaction failed” après reboot)
 
 import os
 import re
@@ -161,7 +162,7 @@ class StartFormView(discord.ui.View):
 
     @discord.ui.button(label="Créer mon profil", style=discord.ButtonStyle.success, custom_id="start_profile_btn")
     async def start_profile_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)  # éviter timeout
+        await interaction.response.defer(ephemeral=True)
         try:
             dm = await interaction.user.create_dm()
             await dm.send(
@@ -188,7 +189,7 @@ class OpenModalView(discord.ui.View):
 
     @discord.ui.button(label="Démarrer", style=discord.ButtonStyle.primary, custom_id="open_modal_btn")
     async def open_modal_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Ouvrir une modal EST la réponse (pas de defer ici)
+        # Ouvrir une modal EST la réponse
         await interaction.response.send_modal(ProfilModal(is_edit=self.is_edit))
 
 class ProfilModal(discord.ui.Modal, title="Profil — Formulaire"):
@@ -366,7 +367,7 @@ class ProfileView(discord.ui.View):
 
     @discord.ui.button(emoji="📩", label="Contacter", style=discord.ButtonStyle.primary, custom_id="pf_contact")
     async def contact_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Ouvrir une modal est la réponse: pas de defer ici
+        # Ouvrir une modal est la réponse
         await interaction.response.send_modal(ContactModal(target_id=self.owner_id))
 
     @discord.ui.button(emoji="✏️", label="Modifier", style=discord.ButtonStyle.secondary, custom_id="pf_edit")
@@ -379,12 +380,12 @@ class ProfileView(discord.ui.View):
         if not prof:
             await interaction.followup.send("Profil introuvable.", ephemeral=True)
             return
-        # Pour fiabilité (modal après defer parfois capricieuse), on ouvre la modal en DM:
+        # Modal en DM pour fiabilité
         try:
             dm = await interaction.user.create_dm()
             await dm.send("✏️ Ouvre ce formulaire pour modifier ton profil :", delete_after=120)
             await dm.send(view=OpenModalView(is_edit=True))
-            await interaction.followup.send("📩 Je t’ai envoyé un DM pour modifier ton profil (ouvre la fenêtre).", ephemeral=True)
+            await interaction.followup.send("📩 Je t’ai envoyé un DM pour modifier ton profil.", ephemeral=True)
         except Exception:
             await interaction.followup.send("⚠️ Impossible d’ouvrir un DM pour l’édition.", ephemeral=True)
 
@@ -463,9 +464,21 @@ class RencontreBot(commands.Bot):
         self.synced = False
 
     async def setup_hook(self):
+        # Vues globales (accueil / DM)
         self.add_view(StartFormView())
         self.add_view(OpenModalView(is_edit=False))
         self.add_view(OpenModalView(is_edit=True))
+
+        # 🔁 Restore des vues persistantes sur les messages de profils déjà publiés
+        try:
+            for uid_str, ref in storage.data.get("profile_msgs", {}).items():
+                owner_id = int(uid_str)
+                message_id = int(ref.get("message_id", 0))
+                if message_id:
+                    # IMPORTANT: rattacher la view au message précis
+                    self.add_view(ProfileView(owner_id=owner_id), message_id=message_id)
+        except Exception as e:
+            print("[Persistent views restore error]", e)
 
     async def on_ready(self):
         try:
@@ -625,4 +638,3 @@ if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise SystemExit("DISCORD_TOKEN est requis (mets-le en variable d’environnement).")
     bot.run(DISCORD_TOKEN)
-

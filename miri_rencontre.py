@@ -1,13 +1,12 @@
-# miri_rencontre.py — Miri Rencontre (stable, ACK immédiat, vues persistantes restaurées)
-# ✔ Bouton accueil → DM modal + photo (upload ou URL) → publication
-# ✔ Profils publics miniature gauche (thumbnail)
-# ✔ Boutons : ❤️ Like | ❌ Pass | 📩 Contacter | ✏️ Modifier | 🗑️ Supprimer
-# ✔ Like/Pass façon Tinder + détection de match (DM aux deux)
-# ✔ Logs détaillés [JJ/MM/AAAA HH:MM]
-# ✔ Aucune slash… sauf /speeddating (staff)
-# ✔ ACK immédiat (send_message) + edit_original_response (évite les timeouts)
-# ✔ RÉATTACHEMENT des vues persistantes au démarrage
-# ✔ Ajout rôle sécurisé (si déjà présent → log, pas d’erreur)
+# miri_rencontre.py — Miri Rencontre (stable + /reset)
+# ✔ ACK immédiat (pas de timeout)
+# ✔ Vues persistantes réattachées au boot
+# ✔ Tinder: Like/Pass/Match + DM
+# ✔ Création/édition/suppression via DM + boutons, miniature à gauche
+# ✔ Logs horodatés [JJ/MM/AAAA HH:MM]
+# ✔ Rôle Accès Rencontre ajouté en sécurité (si déjà présent → log)
+# ✔ /speeddating (staff)
+# ✔ /resetrencontre (admin) et /resetprofil (user)
 
 import os
 import re
@@ -82,7 +81,8 @@ class Storage:
         self.data["profiles"][str(uid)] = prof
         self.save()
 
-    def delete_profile(self, uid: int):
+    def delete_profile_everywhere(self, uid: int):
+        """Supprime totalement un profil + références + nettoie matches où il apparaît."""
         self.data["profiles"].pop(str(uid), None)
         self.data["profile_msgs"].pop(str(uid), None)
         self.data["likes"].pop(str(uid), None)
@@ -163,10 +163,7 @@ class StartFormView(discord.ui.View):
 
     @discord.ui.button(label="Créer mon profil", style=discord.ButtonStyle.success, custom_id="start_profile_btn")
     async def start_profile_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # ACK immédiat
         await interaction.response.send_message("⏳ J’ouvre un DM avec toi…", ephemeral=True)
-
-        # Travail après
         ok = True
         try:
             dm = await interaction.user.create_dm()
@@ -201,7 +198,6 @@ class OpenModalView(discord.ui.View):
 
     @discord.ui.button(label="Démarrer", style=discord.ButtonStyle.primary, custom_id="open_modal_btn")
     async def open_modal_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Ouvrir une modal EST la réponse (ACK inclus)
         await interaction.response.send_modal(ProfilModal(is_edit=self.is_edit))
 
 class ProfilModal(discord.ui.Modal, title="Profil — Formulaire"):
@@ -408,7 +404,7 @@ class ProfileView(discord.ui.View):
             await interaction.edit_original_response(content="❌ Tu ne peux pas supprimer ce profil.")
             return
         ref = storage.get_profile_msg(self.owner_id)
-        storage.delete_profile(self.owner_id)
+        storage.delete_profile_everywhere(self.owner_id)
         if ref:
             ch = interaction.guild.get_channel(ref["channel_id"])
             if isinstance(ch, discord.TextChannel):
@@ -474,6 +470,48 @@ class RencontreBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.synced = False
 
+    # Slash commands: resetrencontre (admin) & resetprofil (user)
+    @app_commands.command(name="resetrencontre", description="⚠️ Réinitialise complètement tous les profils Rencontre (admin)")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def reset_rencontre(self, interaction: discord.Interaction):
+        try:
+            if os.path.exists(DATA_FILE):
+                os.remove(DATA_FILE)
+            # reset en mémoire aussi
+            storage.data = {
+                "profiles": {},
+                "profile_msgs": {},
+                "first_msg_counts": {},
+                "likes": {},
+                "passes": {},
+                "matches": []
+            }
+            storage.save()
+            await interaction.response.send_message(
+                "✅ Données Rencontre **réinitialisées**. Les anciens boutons ne fonctionneront plus (normal). "
+                "Les membres devront recréer leur profil via le bouton.",
+                ephemeral=True
+            )
+            log_line(interaction.guild, f"🗑️ Reset Rencontre (complet) lancé par {interaction.user} ({interaction.user.id})")
+        except Exception as e:
+            await interaction.response.send_message(f"⚠️ Erreur pendant le reset : {e}", ephemeral=True)
+
+    @app_commands.command(name="resetprofil", description="🗑️ Supprime ton propre profil Rencontre")
+    async def reset_profil(self, interaction: discord.Interaction):
+        uid = interaction.user.id
+        had = storage.get_profile(uid) is not None
+        storage.delete_profile_everywhere(uid)
+        # essayer de supprimer le message s'il existe encore
+        ref = storage.get_profile_msg(uid)  # sera None car delete_profile_everywhere l'a retiré
+        if had:
+            await interaction.response.send_message(
+                "🗑️ Ton profil a été supprimé. Tu peux en recréer un avec le bouton.",
+                ephemeral=True
+            )
+            log_line(interaction.guild, f"🗑️ Profil reset par {interaction.user} ({interaction.user.id})")
+        else:
+            await interaction.response.send_message("ℹ️ Tu n’avais pas encore de profil enregistré.", ephemeral=True)
+
     async def setup_hook(self):
         # Vues globales (accueil / DM)
         self.add_view(StartFormView())
@@ -490,12 +528,24 @@ class RencontreBot(commands.Bot):
         except Exception as e:
             print("[Persistent views restore error]", e)
 
+        # enregistre les slash sur le serveur (plus rapide à propager)
+        if GUILD_ID:
+            guild_obj = discord.Object(id=GUILD_ID)
+            self.tree.add_command(self.reset_rencontre, guild=guild_obj)
+            self.tree.add_command(self.reset_profil,    guild=guild_obj)
+
     async def on_ready(self):
         try:
             if not self.synced:
-                self.synced = True  # on ajoutera la slash /speeddating plus bas
+                # sync des slash pour le guild
+                if GUILD_ID:
+                    await self.tree.sync(guild=discord.Object(id=GUILD_ID))
+                else:
+                    await self.tree.sync()
+                self.synced = True
         except Exception as e:
             print("[Sync error]", e)
+
         print(f"✅ Connecté en tant que {self.user} ({self.user.id})")
 
         if CH_WELCOME:
@@ -578,12 +628,12 @@ class RencontreBot(commands.Bot):
                     log_line(guild, f"✅ Création profil : {member} ({member.id})")
                     await message.channel.send("✅ Profil créé. Bienvenue dans l’Espace Rencontre !")
 
-# -------------------- /speeddating --------------------
+# -------------------- /speeddating (staff) --------------------
 class SpeedCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="speeddating", description="Threads privés éphémères (staff).")
+    @app_commands.command(name="speeddating", description="Crée des threads privés éphémères (staff).")
     @app_commands.checks.has_permissions(manage_channels=True)
     async def speeddating(self, interaction: discord.Interaction, couples: int = 5):
         if not CH_SPEED:
@@ -651,9 +701,14 @@ class SpeedCog(commands.Cog):
 # -------------------- Entrée --------------------
 bot = RencontreBot()
 speed = SpeedCog(bot)
-bot.tree.add_command(speed.speeddating, guild=discord.Object(id=GUILD_ID) if GUILD_ID else None)
+# Enregistrer la slash speeddating sur le guild (plus rapide)
+if GUILD_ID:
+    bot.tree.add_command(speed.speeddating, guild=discord.Object(id=GUILD_ID))
+else:
+    bot.tree.add_command(speed.speeddating)
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise SystemExit("DISCORD_TOKEN est requis (mets-le en variable d’environnement).")
     bot.run(DISCORD_TOKEN)
+

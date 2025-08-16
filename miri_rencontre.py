@@ -1,12 +1,13 @@
-# miri_rencontre.py — Miri Rencontre (stable interactions + restore vues persistantes)
+# miri_rencontre.py — Miri Rencontre (stable, ACK immédiat, vues persistantes restaurées)
 # ✔ Bouton accueil → DM modal + photo (upload ou URL) → publication
 # ✔ Profils publics miniature gauche (thumbnail)
 # ✔ Boutons : ❤️ Like | ❌ Pass | 📩 Contacter | ✏️ Modifier | 🗑️ Supprimer
 # ✔ Like/Pass façon Tinder + détection de match (DM aux deux)
 # ✔ Logs détaillés [JJ/MM/AAAA HH:MM]
 # ✔ Aucune slash… sauf /speeddating (staff)
-# ✔ Réponses ACK immédiates (send_message) puis edit_original_response (pas de timeout)
-# ✔ RÉATTACHEMENT des vues persistantes au démarrage (fini les “interaction failed” après reboot)
+# ✔ ACK immédiat (send_message) + edit_original_response (évite les timeouts)
+# ✔ RÉATTACHEMENT des vues persistantes au démarrage
+# ✔ Ajout rôle sécurisé (si déjà présent → log, pas d’erreur)
 
 import os
 import re
@@ -34,7 +35,7 @@ CH_GIRLS      = env_int("CH_GIRLS",      1400520391793053841)
 CH_BOYS       = env_int("CH_BOYS",       1400520396557521058)
 CH_SPEED      = env_int("CH_SPEED",      1402665906546413679)
 CH_LOGS       = env_int("CH_LOGS",       1403154919913033728)
-CH_WELCOME    = env_int("CH_WELCOME",    1400808431941849178)
+CH_WELCOME    = env_int("CH_WELCOME",    0)
 FIRST_MSG_LIMIT = env_int("FIRST_MSG_LIMIT", 1)
 DATA_FILE     = os.getenv("DATA_FILE", "rencontre_data.json")
 TZ = ZoneInfo("Europe/Paris")
@@ -165,7 +166,7 @@ class StartFormView(discord.ui.View):
         # ACK immédiat
         await interaction.response.send_message("⏳ J’ouvre un DM avec toi…", ephemeral=True)
 
-        # Travail après (DM + vue)
+        # Travail après
         ok = True
         try:
             dm = await interaction.user.create_dm()
@@ -186,10 +187,10 @@ class StartFormView(discord.ui.View):
             ok = False
 
         try:
-            if ok:
-                await interaction.edit_original_response(content="📩 C’est bon ! Regarde tes DM pour créer ton profil.")
-            else:
-                await interaction.edit_original_response(content="⚠️ Impossible de t’écrire en DM (DM fermés ?).")
+            await interaction.edit_original_response(
+                content=("📩 C’est bon ! Regarde tes DM pour créer ton profil." if ok
+                         else "⚠️ Impossible de t’écrire en DM (DM fermés ?).")
+            )
         except Exception:
             pass
 
@@ -200,7 +201,7 @@ class OpenModalView(discord.ui.View):
 
     @discord.ui.button(label="Démarrer", style=discord.ButtonStyle.primary, custom_id="open_modal_btn")
     async def open_modal_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Ouvrir une modal EST la réponse
+        # Ouvrir une modal EST la réponse (ACK inclus)
         await interaction.response.send_modal(ProfilModal(is_edit=self.is_edit))
 
 class ProfilModal(discord.ui.Modal, title="Profil — Formulaire"):
@@ -377,8 +378,7 @@ class ProfileView(discord.ui.View):
 
     @discord.ui.button(emoji="📩", label="Contacter", style=discord.ButtonStyle.primary, custom_id="pf_contact")
     async def contact_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Modal = réponse unique (ACK inclus)
-        await interaction.response.send_modal(ContactModal(target_id=self.owner_id))
+        await interaction.response.send_modal(ContactModal(target_id=self.owner_id))  # Modal = ACK inclus
 
     @discord.ui.button(emoji="✏️", label="Modifier", style=discord.ButtonStyle.secondary, custom_id="pf_edit")
     async def edit_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -478,10 +478,9 @@ class RencontreBot(commands.Bot):
         # Vues globales (accueil / DM)
         self.add_view(StartFormView())
         self.add_view(OpenModalView(is_edit=False))
-               # note: même custom_id, mais c'est OK ; l'instance porte l'état is_edit
         self.add_view(OpenModalView(is_edit=True))
 
-        # 🔁 Restore des vues persistantes sur les messages de profils déjà publiés
+        # 🔁 Restore des vues persistantes sur les profils déjà publiés
         try:
             for uid_str, ref in storage.data.get("profile_msgs", {}).items():
                 owner_id = int(uid_str)
@@ -494,7 +493,7 @@ class RencontreBot(commands.Bot):
     async def on_ready(self):
         try:
             if not self.synced:
-                self.synced = True  # pas de sync slash ici ; on ajoute /speeddating plus bas
+                self.synced = True  # on ajoutera la slash /speeddating plus bas
         except Exception as e:
             print("[Sync error]", e)
         print(f"✅ Connecté en tant que {self.user} ({self.user.id})")
@@ -525,6 +524,7 @@ class RencontreBot(commands.Bot):
         if isinstance(message.channel, discord.DMChannel):
             uid = message.author.id
             if uid in awaiting_photo:
+                # récupérer photo (upload ou URL) — "skip" autorisé
                 photo_url = None
                 if message.attachments:
                     att = message.attachments[0]
@@ -555,19 +555,27 @@ class RencontreBot(commands.Bot):
                 storage.set_profile(uid, prof)
                 await publish_or_update_profile(guild, member, prof)
 
+                # donner le rôle accès si création — sécurisé
                 if not is_edit and ROLE_ACCESS:
                     role = guild.get_role(ROLE_ACCESS)
                     if role:
-                        try:
-                            await member.add_roles(role, reason="Création du profil Rencontre")
-                        except Exception:
-                            pass
+                        if role in member.roles:
+                            log_line(guild, f"ℹ️ Rôle déjà présent pour {member} ({member.id}) : {role.name}")
+                        else:
+                            try:
+                                await member.add_roles(role, reason="Création du profil Rencontre")
+                                log_line(guild, f"✅ Rôle attribué à {member} ({member.id}) : {role.name}")
+                            except discord.Forbidden:
+                                log_line(guild, f"⚠️ Permissions insuffisantes pour donner {role.name} à {member} ({member.id}). "
+                                                f"Vérifie Manage Roles et hiérarchie du rôle du bot > {role.name}")
+                            except discord.HTTPException as e:
+                                log_line(guild, f"⚠️ Erreur HTTP en ajoutant le rôle {role.name} à {member} ({member.id}) : {e}")
 
                 if is_edit:
                     log_line(guild, f"✏️ Édition (photo {'changée' if photo_url else 'inchangée'}) : {member} ({member.id})")
                     await message.channel.send("✅ Profil mis à jour.")
                 else:
-                    log_line(guild, f"✅ Création profil : {member} ({member.id}) + rôle Accès Rencontre")
+                    log_line(guild, f"✅ Création profil : {member} ({member.id})")
                     await message.channel.send("✅ Profil créé. Bienvenue dans l’Espace Rencontre !")
 
 # -------------------- /speeddating --------------------

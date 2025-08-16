@@ -1,12 +1,12 @@
-# miri_rencontre.py — Miri Rencontre (full, stable interactions + restore vues persistantes)
+# miri_rencontre.py — Miri Rencontre (stable interactions + restore vues persistantes)
 # ✔ Bouton accueil → DM modal + photo (upload ou URL) → publication
 # ✔ Profils publics miniature gauche (thumbnail)
-# ✔ Boutons: ❤️ Like | ❌ Pass | 📩 Contacter | ✏️ Modifier | 🗑️ Supprimer
+# ✔ Boutons : ❤️ Like | ❌ Pass | 📩 Contacter | ✏️ Modifier | 🗑️ Supprimer
 # ✔ Like/Pass façon Tinder + détection de match (DM aux deux)
 # ✔ Logs détaillés [JJ/MM/AAAA HH:MM]
 # ✔ Aucune slash… sauf /speeddating (staff)
-# ✔ DEFER sur callbacks (sauf ouverture de Modal)
-# ✔ 🔁 RÉATTACHEMENT des vues persistantes au démarrage (fini les “interaction failed” après reboot)
+# ✔ Réponses ACK immédiates (send_message) puis edit_original_response (pas de timeout)
+# ✔ RÉATTACHEMENT des vues persistantes au démarrage (fini les “interaction failed” après reboot)
 
 import os
 import re
@@ -162,7 +162,11 @@ class StartFormView(discord.ui.View):
 
     @discord.ui.button(label="Créer mon profil", style=discord.ButtonStyle.success, custom_id="start_profile_btn")
     async def start_profile_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
+        # ACK immédiat
+        await interaction.response.send_message("⏳ J’ouvre un DM avec toi…", ephemeral=True)
+
+        # Travail après (DM + vue)
+        ok = True
         try:
             dm = await interaction.user.create_dm()
             await dm.send(
@@ -178,9 +182,16 @@ class StartFormView(discord.ui.View):
                 ),
                 view=OpenModalView(is_edit=False)
             )
-            await interaction.followup.send("📩 Je t'ai envoyé un DM pour créer ton profil.", ephemeral=True)
         except Exception:
-            await interaction.followup.send("⚠️ Je ne peux pas t'écrire en DM (DM fermés ?).", ephemeral=True)
+            ok = False
+
+        try:
+            if ok:
+                await interaction.edit_original_response(content="📩 C’est bon ! Regarde tes DM pour créer ton profil.")
+            else:
+                await interaction.edit_original_response(content="⚠️ Impossible de t’écrire en DM (DM fermés ?).")
+        except Exception:
+            pass
 
 class OpenModalView(discord.ui.View):
     def __init__(self, is_edit: bool):
@@ -334,68 +345,68 @@ class ProfileView(discord.ui.View):
 
     @discord.ui.button(emoji="❤️", label="Like", style=discord.ButtonStyle.success, custom_id="pf_like")
     async def like_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("⏳ Je note ton like…", ephemeral=True)
         author = interaction.user
         if author.id == self.owner_id:
-            await interaction.followup.send("🤨 Tu ne peux pas te liker toi-même.", ephemeral=True)
+            await interaction.edit_original_response(content="🤨 Tu ne peux pas te liker toi-même.")
             return
-        guild = interaction.guild
         is_match = storage.like(author.id, self.owner_id)
-        log_line(guild, f"❤️ Like : {author} ({author.id}) → {self.owner_id}")
-        await interaction.followup.send("❤️ Noté !", ephemeral=True)
+        log_line(interaction.guild, f"❤️ Like : {author} ({author.id}) → {self.owner_id}")
+        await interaction.edit_original_response(content="❤️ Like enregistré.")
         if is_match:
-            a = guild.get_member(author.id)
-            b = guild.get_member(self.owner_id)
+            a = interaction.guild.get_member(author.id)
+            b = interaction.guild.get_member(self.owner_id)
             for m1, m2 in [(a, b), (b, a)]:
                 try:
                     dm = await m1.create_dm()
                     await dm.send(f"🔥 **C’est un match !** Tu as liké **{m2.display_name}** et c’est réciproque. Écrivez-vous !")
                 except Exception:
                     pass
-            log_line(guild, f"🔥 Match : {a} ({a.id}) ❤️ {b} ({b.id})")
+            log_line(interaction.guild, f"🔥 Match : {a} ({a.id}) ❤️ {b} ({b.id})")
 
     @discord.ui.button(emoji="❌", label="Pass", style=discord.ButtonStyle.secondary, custom_id="pf_pass")
     async def pass_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("⏳ Je note ton pass…", ephemeral=True)
         author = interaction.user
         if author.id == self.owner_id:
-            await interaction.followup.send("… Pourquoi passer sur toi-même ? 😅", ephemeral=True)
+            await interaction.edit_original_response(content="… Pourquoi passer sur toi-même ? 😅")
             return
         storage.pass_(author.id, self.owner_id)
         log_line(interaction.guild, f"❌ Pass : {author} ({author.id}) → {self.owner_id}")
-        await interaction.followup.send("👌 C’est noté.", ephemeral=True)
+        await interaction.edit_original_response(content="👌 C’est noté.")
 
     @discord.ui.button(emoji="📩", label="Contacter", style=discord.ButtonStyle.primary, custom_id="pf_contact")
     async def contact_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Ouvrir une modal est la réponse
+        # Modal = réponse unique (ACK inclus)
         await interaction.response.send_modal(ContactModal(target_id=self.owner_id))
 
     @discord.ui.button(emoji="✏️", label="Modifier", style=discord.ButtonStyle.secondary, custom_id="pf_edit")
     async def edit_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("⏳ J’ouvre un DM pour modifier ton profil…", ephemeral=True)
         if not allowed_to_manage(interaction, self.owner_id):
-            await interaction.followup.send("❌ Tu ne peux pas modifier ce profil.", ephemeral=True)
+            await interaction.edit_original_response(content="❌ Tu ne peux pas modifier ce profil.")
             return
         prof = storage.get_profile(self.owner_id)
         if not prof:
-            await interaction.followup.send("Profil introuvable.", ephemeral=True)
+            await interaction.edit_original_response(content="Profil introuvable.")
             return
-        # Modal en DM pour fiabilité
+        ok = True
         try:
             dm = await interaction.user.create_dm()
             await dm.send("✏️ Ouvre ce formulaire pour modifier ton profil :", delete_after=120)
             await dm.send(view=OpenModalView(is_edit=True))
-            await interaction.followup.send("📩 Je t’ai envoyé un DM pour modifier ton profil.", ephemeral=True)
         except Exception:
-            await interaction.followup.send("⚠️ Impossible d’ouvrir un DM pour l’édition.", ephemeral=True)
+            ok = False
+        await interaction.edit_original_response(
+            content="📩 DM envoyé, ouvre le formulaire." if ok else "⚠️ Impossible d’ouvrir un DM pour l’édition."
+        )
 
     @discord.ui.button(emoji="🗑️", label="Supprimer", style=discord.ButtonStyle.danger, custom_id="pf_delete")
     async def del_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("⏳ Je supprime ton profil…", ephemeral=True)
         if not allowed_to_manage(interaction, self.owner_id):
-            await interaction.followup.send("❌ Tu ne peux pas supprimer ce profil.", ephemeral=True)
+            await interaction.edit_original_response(content="❌ Tu ne peux pas supprimer ce profil.")
             return
-
         ref = storage.get_profile_msg(self.owner_id)
         storage.delete_profile(self.owner_id)
         if ref:
@@ -408,7 +419,7 @@ class ProfileView(discord.ui.View):
                     pass
         member = interaction.guild.get_member(self.owner_id)
         log_line(interaction.guild, f"🗑️ Suppression : {member} ({member.id})")
-        await interaction.followup.send("✅ Profil supprimé.", ephemeral=True)
+        await interaction.edit_original_response(content="✅ Profil supprimé.")
 
 # -------------------- Profile helpers --------------------
 def build_profile_embed(member: discord.Member, prof: Dict[str, Any]) -> discord.Embed:
@@ -467,6 +478,7 @@ class RencontreBot(commands.Bot):
         # Vues globales (accueil / DM)
         self.add_view(StartFormView())
         self.add_view(OpenModalView(is_edit=False))
+               # note: même custom_id, mais c'est OK ; l'instance porte l'état is_edit
         self.add_view(OpenModalView(is_edit=True))
 
         # 🔁 Restore des vues persistantes sur les messages de profils déjà publiés
@@ -475,7 +487,6 @@ class RencontreBot(commands.Bot):
                 owner_id = int(uid_str)
                 message_id = int(ref.get("message_id", 0))
                 if message_id:
-                    # IMPORTANT: rattacher la view au message précis
                     self.add_view(ProfileView(owner_id=owner_id), message_id=message_id)
         except Exception as e:
             print("[Persistent views restore error]", e)
@@ -483,7 +494,7 @@ class RencontreBot(commands.Bot):
     async def on_ready(self):
         try:
             if not self.synced:
-                self.synced = True
+                self.synced = True  # pas de sync slash ici ; on ajoute /speeddating plus bas
         except Exception as e:
             print("[Sync error]", e)
         print(f"✅ Connecté en tant que {self.user} ({self.user.id})")

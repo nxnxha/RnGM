@@ -26,7 +26,7 @@ CH_GIRLS      = env_int("CH_GIRLS",      1400520391793053841)            # salon
 CH_BOYS       = env_int("CH_BOYS",       1400520396557521058)            # salon profils hommes
 CH_SPEED      = env_int("CH_SPEED",      1402665906546413679)            # salon speed dating
 CH_LOGS       = env_int("CH_LOGS",       1403154919913033728)            # salon logs
-CH_WELCOME    = env_int("CH_WELCOME",    0)                              # salon d’accueil (0 = désactivé)
+CH_WELCOME    = env_int("CH_WELCOME",    1400808431941849178)                              # salon d’accueil (0 = désactivé)
 FIRST_MSG_LIMIT = env_int("FIRST_MSG_LIMIT", 1)                          # anti-spam 1er message
 DATA_FILE     = os.getenv("DATA_FILE", "rencontre_data.json")            # stockage JSON
 

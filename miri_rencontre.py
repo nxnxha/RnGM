@@ -1,10 +1,11 @@
-# miri_rencontre.py — Miri Rencontre (Cogs + slash OK, ACK immédiat, reset admin)
-# ✅ Slash commands stables via Cogs : /resetrencontre (admin), /resetprofil, /speeddating (staff)
-# ✅ "Interaction failed" corrigé : ACK immédiat + restauration des vues persistantes au boot
-# ✅ Création/édition du profil en DM + photo (upload ou URL)
-# ✅ Tinder: Like / Pass / Match (+ DM aux deux)
-# ✅ Logs horodatés [JJ/MM/AAAA HH:MM]
-# ✅ Rôle Accès Rencontre ajouté en sécurité (si déjà présent → log)
+# miri_rencontre.py — Miri Rencontre (DM pas-à-pas, stable, reset admin)
+# ✔ Formulaire en DM pas-à-pas (pas de Modal en DM → fini “Échec de l’interaction”)
+# ✔ ACK immédiat + edit (évite timeouts)
+# ✔ Vues persistantes restaurées au boot
+# ✔ /resetrencontre (admin), /resetprofil (user), /speeddating (staff)
+# ✔ Tinder: Like / Pass / Match (+ DM)
+# ✔ Logs horodatés [JJ/MM/AAAA HH:MM]
+# ✔ Rôle Accès Rencontre ajouté en sécurité
 
 import os
 import re
@@ -41,7 +42,7 @@ TZ = ZoneInfo("Europe/Paris")
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
-intents.message_content = True  # pour lire les DM (photo/lien)
+intents.message_content = True  # lire les DM (photo/lien)
 
 # -------------------- Storage --------------------
 class Storage:
@@ -151,8 +152,9 @@ def allowed_to_manage(inter: discord.Interaction, owner_id: int) -> bool:
         return True
     return False
 
-# -------------------- State (photo après modal) --------------------
-awaiting_photo: Dict[int, Dict[str, Any]] = {}  # uid -> {"profile":..., "is_edit": bool}
+# -------------------- States --------------------
+awaiting_photo: Dict[int, Dict[str, Any]] = {}   # uid -> {"profile":..., "is_edit": bool}
+dm_sessions: Dict[int, Dict[str, Any]] = {}      # uid -> {step:int, is_edit:bool, answers:dict}
 
 # -------------------- Views & Modals --------------------
 class StartFormView(discord.ui.View):
@@ -161,7 +163,6 @@ class StartFormView(discord.ui.View):
 
     @discord.ui.button(label="Créer mon profil", style=discord.ButtonStyle.success, custom_id="start_profile_btn")
     async def start_profile_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # ACK immédiat pour éviter le timeout
         await interaction.response.send_message("⏳ J’ouvre un DM avec toi…", ephemeral=True)
         ok = True
         try:
@@ -171,13 +172,13 @@ class StartFormView(discord.ui.View):
                     title="Création de ton profil — DM",
                     description=(
                         "On va remplir le formulaire en **privé**.\n\n"
-                        "1) Clique sur **Démarrer** pour ouvrir le formulaire (modal)\n"
-                        "2) Ensuite, **envoie une photo** (upload ou lien) dans ce DM\n"
-                        "3) Je publierai ton profil et je te donnerai le **rôle Accès Rencontre** ✅"
+                        "👉 Clique sur **Démarrer** ci-dessous, puis réponds aux questions.\n"
+                        "Ensuite, **envoie une photo** (upload ou lien) dans ce DM.\n"
+                        "Je publierai ton profil et je te donnerai le **rôle Accès Rencontre** ✅"
                     ),
                     color=discord.Color.purple()
                 ),
-                view=OpenModalView(is_edit=False)
+                view=StartDMFormView(is_edit=False)
             )
         except Exception:
             ok = False
@@ -190,97 +191,17 @@ class StartFormView(discord.ui.View):
         except Exception:
             pass
 
-class OpenModalView(discord.ui.View):
+class StartDMFormView(discord.ui.View):
     def __init__(self, is_edit: bool):
         super().__init__(timeout=None)
         self.is_edit = is_edit
 
-    @discord.ui.button(label="Démarrer", style=discord.ButtonStyle.primary, custom_id="open_modal_btn")
-    async def open_modal_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Ouvrir la Modal EST la réponse (ACK inclus)
-        await interaction.response.send_modal(ProfilModal(is_edit=self.is_edit))
-
-class ProfilModal(discord.ui.Modal, title="Profil — Formulaire"):
-    def __init__(self, is_edit: bool):
-        super().__init__(timeout=300)
-        self.is_edit = is_edit
-        self.age = discord.ui.TextInput(label="Âge (>=18)", min_length=1, max_length=3, placeholder="18")
-        self.genre = discord.ui.TextInput(label="Genre (Fille/Homme)", min_length=1, max_length=10, placeholder="Fille")
-        self.orientation = discord.ui.TextInput(label="Attirance", required=False, max_length=50, placeholder="Hétéro, Bi, etc.")
-        self.passions = discord.ui.TextInput(label="Passions", required=False, style=discord.TextStyle.paragraph, max_length=300)
-        self.activite = discord.ui.TextInput(label="Activité", required=False, max_length=100)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not isinstance(interaction.channel, discord.DMChannel):
-            await interaction.response.send_message("Ouvre d’abord le **DM** depuis le serveur (bouton *Créer mon profil*).", ephemeral=True)
-            return
-        try:
-            age_val = int(str(self.age.value).strip())
-        except Exception:
-            await interaction.response.send_message("Âge invalide.", ephemeral=True)
-            return
-        if age_val < 18:
-            await interaction.response.send_message("❌ Réservé aux 18 ans et plus.", ephemeral=True)
-            return
-
-        old = storage.get_profile(interaction.user.id) or {}
-        photo_keep = old.get("photo_url", "")
-
-        profile = {
-            "age": age_val,
-            "genre": str(self.genre.value).strip(),
-            "orientation": str(self.orientation.value).strip(),
-            "passions": str(self.passions.value).strip(),
-            "activite": str(self.activite.value).strip(),
-            "photo_url": photo_keep if self.is_edit else "",
-            "updated_at": datetime.now(TZ).isoformat()
-        }
-        awaiting_photo[interaction.user.id] = {"profile": profile, "is_edit": self.is_edit}
-        await interaction.response.send_message(
-            ("✔️ Modif reçue ! " if self.is_edit else "✔️ Formulaire reçu ! ")
-            + "Maintenant, **envoie une photo** dans ce DM (upload ou lien). "
-              "Écris `skip` pour ne pas changer/ajouter la photo.",
-            ephemeral=True
-        )
-
-class ContactModal(discord.ui.Modal, title="Premier message"):
-    def __init__(self, target_id: int):
-        super().__init__(timeout=300)
-        self.target_id = target_id
-        self.msg = discord.ui.TextInput(
-            label="Ton message (1er contact)",
-            style=discord.TextStyle.paragraph,
-            min_length=5,
-            max_length=600,
-            placeholder="Présente-toi vite fait et sois respectueux(se) 😉"
-        )
-        self.add_item(self.msg)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        author = interaction.user
-        guild = discord.utils.get(interaction.client.guilds, id=GUILD_ID)
-        target = guild.get_member(self.target_id) if guild else None
-        if not target:
-            await interaction.response.send_message("❌ Utilisateur introuvable.", ephemeral=True)
-            return
-
-        count = storage.inc_first_msg(author.id, target.id)
-        if count > FIRST_MSG_LIMIT:
-            await interaction.response.send_message(
-                f"❌ Tu as déjà envoyé {FIRST_MSG_LIMIT} premier message à cette personne. Attends une réponse.",
-                ephemeral=True
-            )
-            return
-
-        txt = f"**{author.display_name}** souhaite te contacter :\n> {self.msg.value}\n\n(Tu peux répondre directement à ce message pour poursuivre.)"
-        try:
-            dm = await target.create_dm()
-            await dm.send(txt)
-            await interaction.response.send_message("✅ Message envoyé en DM à la personne.", ephemeral=True)
-            log_line(guild, f"📨 Contact : {author} ({author.id}) → {target} ({target.id})")
-        except Exception:
-            await interaction.response.send_message("⚠️ Impossible d’envoyer le DM (DM fermés ?).", ephemeral=True)
-            log_line(guild, f"⚠️ Contact raté (DM fermés) : {author} ({author.id}) → {target} ({target.id})")
+    @discord.ui.button(label="Démarrer", style=discord.ButtonStyle.primary, custom_id="start_dm_form")
+    async def start_dm_form(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("✅ OK, on fait ça ici en DM. Réponds à mes questions ⤵️", ephemeral=True)
+        uid = interaction.user.id
+        dm_sessions[uid] = {"step": 0, "is_edit": self.is_edit, "answers": {}}
+        await interaction.channel.send("1/5 — Quel est **ton âge** ? (nombre ≥ 18)")
 
 # -------------------- Profile View (sous chaque profil) --------------------
 class ProfileView(discord.ui.View):
@@ -322,7 +243,43 @@ class ProfileView(discord.ui.View):
 
     @discord.ui.button(emoji="📩", label="Contacter", style=discord.ButtonStyle.primary, custom_id="pf_contact")
     async def contact_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(ContactModal(target_id=self.owner_id))  # Modal = ACK inclus
+        # petite modal pour le 1er message fonctionne bien en guild; en DM on n’en a pas besoin
+        class ContactModal(discord.ui.Modal, title="Premier message"):
+            def __init__(self, target_id: int):
+                super().__init__(timeout=300)
+                self.target_id = target_id
+                self.msg = discord.ui.TextInput(
+                    label="Ton message (1er contact)",
+                    style=discord.TextStyle.paragraph,
+                    min_length=5, max_length=600
+                )
+                self.add_item(self.msg)
+
+            async def on_submit(self, inter: discord.Interaction):
+                author = inter.user
+                guild = inter.guild
+                target = guild.get_member(self.target_id) if guild else None
+                if not target:
+                    await inter.response.send_message("❌ Utilisateur introuvable.", ephemeral=True)
+                    return
+                count = storage.inc_first_msg(author.id, target.id)
+                if count > FIRST_MSG_LIMIT:
+                    await inter.response.send_message(
+                        f"❌ Tu as déjà envoyé {FIRST_MSG_LIMIT} premier message à cette personne.",
+                        ephemeral=True
+                    )
+                    return
+                txt = f"**{author.display_name}** souhaite te contacter :\n> {self.msg.value}\n\n(Tu peux répondre directement à ce message.)"
+                try:
+                    dm = await target.create_dm()
+                    await dm.send(txt)
+                    await inter.response.send_message("✅ Message envoyé en DM à la personne.", ephemeral=True)
+                    log_line(guild, f"📨 Contact : {author} ({author.id}) → {target} ({target.id})")
+                except Exception:
+                    await inter.response.send_message("⚠️ Impossible d’envoyer le DM (DM fermés ?).", ephemeral=True)
+                    log_line(guild, f"⚠️ Contact raté (DM fermés) : {author} ({author.id}) → {target} ({target.id})")
+
+        await interaction.response.send_modal(ContactModal(target_id=self.owner_id))
 
     @discord.ui.button(emoji="✏️", label="Modifier", style=discord.ButtonStyle.secondary, custom_id="pf_edit")
     async def edit_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -330,15 +287,10 @@ class ProfileView(discord.ui.View):
         if not allowed_to_manage(interaction, self.owner_id):
             await interaction.edit_original_response(content="❌ Tu ne peux pas modifier ce profil.")
             return
-        prof = storage.get_profile(self.owner_id)
-        if not prof:
-            await interaction.edit_original_response(content="Profil introuvable.")
-            return
         ok = True
         try:
             dm = await interaction.user.create_dm()
-            await dm.send("✏️ Ouvre ce formulaire pour modifier ton profil :", delete_after=120)
-            await dm.send(view=OpenModalView(is_edit=True))
+            await dm.send("✏️ On modifie ton profil ici. Clique **Démarrer** :", view=StartDMFormView(is_edit=True))
         except Exception:
             ok = False
         await interaction.edit_original_response(
@@ -421,8 +373,8 @@ class RencontreBot(commands.Bot):
     async def setup_hook(self):
         # Vues persistantes globales
         self.add_view(StartFormView())
-        self.add_view(OpenModalView(is_edit=False))
-        self.add_view(OpenModalView(is_edit=True))
+        self.add_view(StartDMFormView(is_edit=False))
+        self.add_view(StartDMFormView(is_edit=True))
 
         # 🔁 Restaurer les vues des profils publiés (après reboot)
         try:
@@ -434,7 +386,7 @@ class RencontreBot(commands.Bot):
         except Exception as e:
             print("[Persistent views restore error]", e)
 
-        # Ajouter les Cogs (slash commands)
+        # Cogs (slash commands)
         self.add_cog(AdminCog(self))
         self.add_cog(SpeedCog(self))
 
@@ -470,7 +422,6 @@ class RencontreBot(commands.Bot):
                     pass
 
     async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        # Handler global des erreurs slash
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(f"⚠️ Erreur: {error}", ephemeral=True)
@@ -482,9 +433,76 @@ class RencontreBot(commands.Bot):
     async def on_message(self, message: discord.Message):
         if message.author.bot:
             return
-        # Gestion de la photo en DM après le formulaire
+
+        # --- Formulaire DM pas-à-pas ---
         if isinstance(message.channel, discord.DMChannel):
             uid = message.author.id
+
+            # 1) session de formulaire
+            if uid in dm_sessions:
+                s = dm_sessions[uid]
+                step = s["step"]
+                content = message.content.strip()
+
+                try:
+                    if step == 0:
+                        age_val = int(content)
+                        if age_val < 18:
+                            await message.channel.send("❌ Réservé aux 18 ans et plus. Donne un âge valide (≥18).")
+                            return
+                        s["answers"]["age"] = age_val
+                        s["step"] = 1
+                        await message.channel.send("2/5 — Ton **genre** ? (Fille / Homme)")
+                        return
+
+                    if step == 1:
+                        s["answers"]["genre"] = content
+                        s["step"] = 2
+                        await message.channel.send("3/5 — Ton **attirance** ? (ex: Hétéro, Bi…) *(ou `skip`)*")
+                        return
+
+                    if step == 2:
+                        s["answers"]["orientation"] = "" if content.lower()=="skip" else content
+                        s["step"] = 3
+                        await message.channel.send("4/5 — Tes **passions** ? *(ou `skip`)*")
+                        return
+
+                    if step == 3:
+                        s["answers"]["passions"] = "" if content.lower()=="skip" else content
+                        s["step"] = 4
+                        await message.channel.send("5/5 — Ton **activité** ? *(ou `skip`)*")
+                        return
+
+                    if step == 4:
+                        s["answers"]["activite"] = "" if content.lower()=="skip" else content
+                        # terminé → demande photo
+                        is_edit = s["is_edit"]
+                        answers = s["answers"]
+                        dm_sessions.pop(uid, None)
+
+                        old = storage.get_profile(uid) or {}
+                        photo_keep = old.get("photo_url", "")
+                        profile = {
+                            "age": answers["age"],
+                            "genre": answers["genre"],
+                            "orientation": answers.get("orientation",""),
+                            "passions": answers.get("passions",""),
+                            "activite": answers.get("activite",""),
+                            "photo_url": photo_keep if is_edit else "",
+                            "updated_at": datetime.now(TZ).isoformat()
+                        }
+                        awaiting_photo[uid] = {"profile": profile, "is_edit": is_edit}
+                        await message.channel.send(
+                            "✅ Formulaire reçu ! Maintenant, **envoie une photo** (upload ou lien). "
+                            "Tu peux répondre `skip` pour ne pas mettre/changer la photo."
+                        )
+                        return
+
+                except ValueError:
+                    await message.channel.send("⚠️ Donne un **nombre** pour l’âge (ex: 22).")
+                    return
+
+            # 2) réception de la photo (ou skip)
             if uid in awaiting_photo:
                 photo_url = None
                 if message.attachments:
@@ -516,7 +534,7 @@ class RencontreBot(commands.Bot):
                 storage.set_profile(uid, prof)
                 await publish_or_update_profile(guild, member, prof)
 
-                # Donner le rôle accès si création — sécurisé
+                # donner le rôle accès si création — sécurisé
                 if not is_edit and ROLE_ACCESS:
                     role = guild.get_role(ROLE_ACCESS)
                     if role:
@@ -527,8 +545,7 @@ class RencontreBot(commands.Bot):
                                 await member.add_roles(role, reason="Création du profil Rencontre")
                                 log_line(guild, f"✅ Rôle attribué à {member} ({member.id}) : {role.name}")
                             except discord.Forbidden:
-                                log_line(guild, f"⚠️ Permissions insuffisantes pour donner {role.name} à {member} ({member.id}). "
-                                                f"Vérifie Manage Roles et hiérarchie du rôle du bot > {role.name}")
+                                log_line(guild, f"⚠️ Permissions insuffisantes rôle {role.name} → {member} ({member.id})")
                             except discord.HTTPException as e:
                                 log_line(guild, f"⚠️ Erreur HTTP rôle {role.name} → {member} ({member.id}) : {e}")
 
@@ -563,7 +580,7 @@ class AdminCog(commands.Cog, name="Admin"):
             storage.save()
             await interaction.response.send_message(
                 "✅ Données Rencontre **réinitialisées**.\n"
-                "• Les anciens messages de profils n’auront plus de boutons valides (supprime-les si besoin).\n"
+                "• Les anciens messages de profils n’ont plus de boutons valides (supprime-les si besoin).\n"
                 "• Les membres peuvent recréer leur profil via le bouton.",
                 ephemeral=True
             )

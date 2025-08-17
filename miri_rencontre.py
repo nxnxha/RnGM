@@ -1,12 +1,10 @@
-# miri_rencontre.py — Miri Rencontre (stable + /reset)
-# ✔ ACK immédiat (pas de timeout)
-# ✔ Vues persistantes réattachées au boot
-# ✔ Tinder: Like/Pass/Match + DM
-# ✔ Création/édition/suppression via DM + boutons, miniature à gauche
-# ✔ Logs horodatés [JJ/MM/AAAA HH:MM]
-# ✔ Rôle Accès Rencontre ajouté en sécurité (si déjà présent → log)
-# ✔ /speeddating (staff)
-# ✔ /resetrencontre (admin) et /resetprofil (user)
+# miri_rencontre.py — Miri Rencontre (Cogs + slash OK, ACK immédiat, reset admin)
+# ✅ Slash commands stables via Cogs : /resetrencontre (admin), /resetprofil, /speeddating (staff)
+# ✅ "Interaction failed" corrigé : ACK immédiat + restauration des vues persistantes au boot
+# ✅ Création/édition du profil en DM + photo (upload ou URL)
+# ✅ Tinder: Like / Pass / Match (+ DM aux deux)
+# ✅ Logs horodatés [JJ/MM/AAAA HH:MM]
+# ✅ Rôle Accès Rencontre ajouté en sécurité (si déjà présent → log)
 
 import os
 import re
@@ -34,15 +32,16 @@ CH_GIRLS      = env_int("CH_GIRLS",      1400520391793053841)
 CH_BOYS       = env_int("CH_BOYS",       1400520396557521058)
 CH_SPEED      = env_int("CH_SPEED",      1402665906546413679)
 CH_LOGS       = env_int("CH_LOGS",       1403154919913033728)
-CH_WELCOME    = env_int("CH_WELCOME",    1400808431941849178)
+CH_WELCOME    = env_int("CH_WELCOME",    0)
 FIRST_MSG_LIMIT = env_int("FIRST_MSG_LIMIT", 1)
 DATA_FILE     = os.getenv("DATA_FILE", "rencontre_data.json")
 TZ = ZoneInfo("Europe/Paris")
 
+# intents
 intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
 intents.guilds = True
+intents.members = True
+intents.message_content = True  # pour lire les DM (photo/lien)
 
 # -------------------- Storage --------------------
 class Storage:
@@ -82,7 +81,6 @@ class Storage:
         self.save()
 
     def delete_profile_everywhere(self, uid: int):
-        """Supprime totalement un profil + références + nettoie matches où il apparaît."""
         self.data["profiles"].pop(str(uid), None)
         self.data["profile_msgs"].pop(str(uid), None)
         self.data["likes"].pop(str(uid), None)
@@ -139,8 +137,8 @@ storage = Storage(DATA_FILE)
 def now_ts() -> str:
     return datetime.now(TZ).strftime("[%d/%m/%Y %H:%M]")
 
-def log_line(guild: discord.Guild, text: str):
-    if not CH_LOGS:
+def log_line(guild: Optional[discord.Guild], text: str):
+    if not guild or not CH_LOGS:
         return
     ch = guild.get_channel(CH_LOGS)
     if isinstance(ch, discord.TextChannel):
@@ -163,6 +161,7 @@ class StartFormView(discord.ui.View):
 
     @discord.ui.button(label="Créer mon profil", style=discord.ButtonStyle.success, custom_id="start_profile_btn")
     async def start_profile_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # ACK immédiat pour éviter le timeout
         await interaction.response.send_message("⏳ J’ouvre un DM avec toi…", ephemeral=True)
         ok = True
         try:
@@ -198,6 +197,7 @@ class OpenModalView(discord.ui.View):
 
     @discord.ui.button(label="Démarrer", style=discord.ButtonStyle.primary, custom_id="open_modal_btn")
     async def open_modal_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Ouvrir la Modal EST la réponse (ACK inclus)
         await interaction.response.send_modal(ProfilModal(is_edit=self.is_edit))
 
 class ProfilModal(discord.ui.Modal, title="Profil — Formulaire"):
@@ -282,59 +282,7 @@ class ContactModal(discord.ui.Modal, title="Premier message"):
             await interaction.response.send_message("⚠️ Impossible d’envoyer le DM (DM fermés ?).", ephemeral=True)
             log_line(guild, f"⚠️ Contact raté (DM fermés) : {author} ({author.id}) → {target} ({target.id})")
 
-class EditProfilModal(discord.ui.Modal, title="Modifier mon profil"):
-    def __init__(self, owner_id: int, original: Dict[str, Any]):
-        super().__init__(timeout=300)
-        self.owner_id = owner_id
-        self.original = original
-        self.age = discord.ui.TextInput(label="Âge (>=18)", default=str(original.get("age","")), max_length=3)
-        self.genre = discord.ui.TextInput(label="Genre (Fille/Homme)", default=original.get("genre",""), max_length=10)
-        self.orientation = discord.ui.TextInput(label="Attirance", default=original.get("orientation",""), required=False, max_length=50)
-        self.passions = discord.ui.TextInput(label="Passions", default=original.get("passions",""), required=False, style=discord.TextStyle.paragraph, max_length=300)
-        self.activite = discord.ui.TextInput(label="Activité", default=original.get("activite",""), required=False, max_length=100)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if interaction.user.id != self.owner_id and not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("❌ Tu n’as pas l’autorisation.", ephemeral=True)
-            return
-        try:
-            age_val = int(str(self.age.value).strip())
-        except Exception:
-            await interaction.response.send_message("Âge invalide.", ephemeral=True)
-            return
-        if age_val < 18:
-            await interaction.response.send_message("❌ Réservé aux 18 ans et plus.", ephemeral=True)
-            return
-
-        prof = storage.get_profile(self.owner_id) or {}
-        prof.update({
-            "age": age_val,
-            "genre": str(self.genre.value).strip(),
-            "orientation": str(self.orientation.value).strip(),
-            "passions": str(self.passions.value).strip(),
-            "activite": str(self.activite.value).strip(),
-            "updated_at": datetime.now(TZ).isoformat()
-        })
-        storage.set_profile(self.owner_id, prof)
-
-        guild = interaction.guild
-        member = guild.get_member(self.owner_id)
-        view = ProfileView(owner_id=self.owner_id)
-        embed = build_profile_embed(member, prof)
-        ref = storage.get_profile_msg(self.owner_id)
-        if ref:
-            ch = guild.get_channel(ref["channel_id"])
-            if isinstance(ch, discord.TextChannel):
-                try:
-                    msg = await ch.fetch_message(ref["message_id"])
-                    await msg.edit(embed=embed, view=view, content=None)
-                except Exception:
-                    pass
-
-        log_line(guild, f"✏️ Édition : {member} ({member.id})")
-        await interaction.response.send_message("✅ Profil mis à jour. (Pour changer la photo, DM une nouvelle image ou URL.)", ephemeral=True)
-
-# -------------------- Profile View --------------------
+# -------------------- Profile View (sous chaque profil) --------------------
 class ProfileView(discord.ui.View):
     def __init__(self, owner_id: int):
         super().__init__(timeout=None)
@@ -417,7 +365,7 @@ class ProfileView(discord.ui.View):
         log_line(interaction.guild, f"🗑️ Suppression : {member} ({member.id})")
         await interaction.edit_original_response(content="✅ Profil supprimé.")
 
-# -------------------- Profile helpers --------------------
+# -------------------- Helpers profils --------------------
 def build_profile_embed(member: discord.Member, prof: Dict[str, Any]) -> discord.Embed:
     e = discord.Embed(
         title=f"Profil de {member.display_name}",
@@ -464,61 +412,19 @@ async def publish_or_update_profile(guild: discord.Guild, member: discord.Member
     msg = await ch.send(embed=embed, view=view)
     storage.set_profile_msg(member.id, ch.id, msg.id)
 
-# -------------------- Bot / Events --------------------
+# -------------------- BOT --------------------
 class RencontreBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
         self.synced = False
 
-    # Slash commands: resetrencontre (admin) & resetprofil (user)
-    @app_commands.command(name="resetrencontre", description="⚠️ Réinitialise complètement tous les profils Rencontre (admin)")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def reset_rencontre(self, interaction: discord.Interaction):
-        try:
-            if os.path.exists(DATA_FILE):
-                os.remove(DATA_FILE)
-            # reset en mémoire aussi
-            storage.data = {
-                "profiles": {},
-                "profile_msgs": {},
-                "first_msg_counts": {},
-                "likes": {},
-                "passes": {},
-                "matches": []
-            }
-            storage.save()
-            await interaction.response.send_message(
-                "✅ Données Rencontre **réinitialisées**. Les anciens boutons ne fonctionneront plus (normal). "
-                "Les membres devront recréer leur profil via le bouton.",
-                ephemeral=True
-            )
-            log_line(interaction.guild, f"🗑️ Reset Rencontre (complet) lancé par {interaction.user} ({interaction.user.id})")
-        except Exception as e:
-            await interaction.response.send_message(f"⚠️ Erreur pendant le reset : {e}", ephemeral=True)
-
-    @app_commands.command(name="resetprofil", description="🗑️ Supprime ton propre profil Rencontre")
-    async def reset_profil(self, interaction: discord.Interaction):
-        uid = interaction.user.id
-        had = storage.get_profile(uid) is not None
-        storage.delete_profile_everywhere(uid)
-        # essayer de supprimer le message s'il existe encore
-        ref = storage.get_profile_msg(uid)  # sera None car delete_profile_everywhere l'a retiré
-        if had:
-            await interaction.response.send_message(
-                "🗑️ Ton profil a été supprimé. Tu peux en recréer un avec le bouton.",
-                ephemeral=True
-            )
-            log_line(interaction.guild, f"🗑️ Profil reset par {interaction.user} ({interaction.user.id})")
-        else:
-            await interaction.response.send_message("ℹ️ Tu n’avais pas encore de profil enregistré.", ephemeral=True)
-
     async def setup_hook(self):
-        # Vues globales (accueil / DM)
+        # Vues persistantes globales
         self.add_view(StartFormView())
         self.add_view(OpenModalView(is_edit=False))
         self.add_view(OpenModalView(is_edit=True))
 
-        # 🔁 Restore des vues persistantes sur les profils déjà publiés
+        # 🔁 Restaurer les vues des profils publiés (après reboot)
         try:
             for uid_str, ref in storage.data.get("profile_msgs", {}).items():
                 owner_id = int(uid_str)
@@ -528,26 +434,21 @@ class RencontreBot(commands.Bot):
         except Exception as e:
             print("[Persistent views restore error]", e)
 
-        # enregistre les slash sur le serveur (plus rapide à propager)
-        if GUILD_ID:
-            guild_obj = discord.Object(id=GUILD_ID)
-            self.tree.add_command(self.reset_rencontre, guild=guild_obj)
-            self.tree.add_command(self.reset_profil,    guild=guild_obj)
+        # Ajouter les Cogs (slash commands)
+        self.add_cog(AdminCog(self))
+        self.add_cog(SpeedCog(self))
+
+        # Sync des slash sur le guild (plus rapide)
+        try:
+            if GUILD_ID:
+                await self.tree.sync(guild=discord.Object(id=GUILD_ID))
+            else:
+                await self.tree.sync()
+        except Exception as e:
+            print("[Slash sync error]", e)
 
     async def on_ready(self):
-        try:
-            if not self.synced:
-                # sync des slash pour le guild
-                if GUILD_ID:
-                    await self.tree.sync(guild=discord.Object(id=GUILD_ID))
-                else:
-                    await self.tree.sync()
-                self.synced = True
-        except Exception as e:
-            print("[Sync error]", e)
-
         print(f"✅ Connecté en tant que {self.user} ({self.user.id})")
-
         if CH_WELCOME:
             ch = self.get_channel(CH_WELCOME)
             if isinstance(ch, discord.TextChannel):
@@ -568,13 +469,23 @@ class RencontreBot(commands.Bot):
                 except Exception:
                     pass
 
+    async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        # Handler global des erreurs slash
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"⚠️ Erreur: {error}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"⚠️ Erreur: {error}", ephemeral=True)
+        except Exception:
+            pass
+
     async def on_message(self, message: discord.Message):
         if message.author.bot:
             return
+        # Gestion de la photo en DM après le formulaire
         if isinstance(message.channel, discord.DMChannel):
             uid = message.author.id
             if uid in awaiting_photo:
-                # récupérer photo (upload ou URL) — "skip" autorisé
                 photo_url = None
                 if message.attachments:
                     att = message.attachments[0]
@@ -605,7 +516,7 @@ class RencontreBot(commands.Bot):
                 storage.set_profile(uid, prof)
                 await publish_or_update_profile(guild, member, prof)
 
-                # donner le rôle accès si création — sécurisé
+                # Donner le rôle accès si création — sécurisé
                 if not is_edit and ROLE_ACCESS:
                     role = guild.get_role(ROLE_ACCESS)
                     if role:
@@ -619,7 +530,7 @@ class RencontreBot(commands.Bot):
                                 log_line(guild, f"⚠️ Permissions insuffisantes pour donner {role.name} à {member} ({member.id}). "
                                                 f"Vérifie Manage Roles et hiérarchie du rôle du bot > {role.name}")
                             except discord.HTTPException as e:
-                                log_line(guild, f"⚠️ Erreur HTTP en ajoutant le rôle {role.name} à {member} ({member.id}) : {e}")
+                                log_line(guild, f"⚠️ Erreur HTTP rôle {role.name} → {member} ({member.id}) : {e}")
 
                 if is_edit:
                     log_line(guild, f"✏️ Édition (photo {'changée' if photo_url else 'inchangée'}) : {member} ({member.id})")
@@ -628,8 +539,54 @@ class RencontreBot(commands.Bot):
                     log_line(guild, f"✅ Création profil : {member} ({member.id})")
                     await message.channel.send("✅ Profil créé. Bienvenue dans l’Espace Rencontre !")
 
-# -------------------- /speeddating (staff) --------------------
-class SpeedCog(commands.Cog):
+# -------------------- COGS: Admin & Staff --------------------
+class AdminCog(commands.Cog, name="Admin"):
+    """Slash admin/user: resetrencontre, resetprofil"""
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    @app_commands.command(name="resetrencontre", description="⚠️ Réinitialise complètement tous les profils Rencontre (admin)")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def reset_rencontre(self, interaction: discord.Interaction):
+        try:
+            if os.path.exists(DATA_FILE):
+                os.remove(DATA_FILE)
+            # reset en mémoire
+            storage.data = {
+                "profiles": {},
+                "profile_msgs": {},
+                "first_msg_counts": {},
+                "likes": {},
+                "passes": {},
+                "matches": []
+            }
+            storage.save()
+            await interaction.response.send_message(
+                "✅ Données Rencontre **réinitialisées**.\n"
+                "• Les anciens messages de profils n’auront plus de boutons valides (supprime-les si besoin).\n"
+                "• Les membres peuvent recréer leur profil via le bouton.",
+                ephemeral=True
+            )
+            log_line(interaction.guild, f"🗑️ Reset Rencontre (complet) par {interaction.user} ({interaction.user.id})")
+        except Exception as e:
+            await interaction.response.send_message(f"⚠️ Erreur pendant le reset : {e}", ephemeral=True)
+
+    @app_commands.command(name="resetprofil", description="🗑️ Supprime ton propre profil Rencontre")
+    async def reset_profil(self, interaction: discord.Interaction):
+        uid = interaction.user.id
+        had = storage.get_profile(uid) is not None
+        storage.delete_profile_everywhere(uid)
+        if had:
+            await interaction.response.send_message(
+                "🗑️ Ton profil a été supprimé. Utilise le bouton **Créer mon profil** pour recommencer.",
+                ephemeral=True
+            )
+            log_line(interaction.guild, f"🗑️ Profil reset par {interaction.user} ({interaction.user.id})")
+        else:
+            await interaction.response.send_message("ℹ️ Tu n’avais pas encore de profil enregistré.", ephemeral=True)
+
+class SpeedCog(commands.Cog, name="SpeedDating"):
+    """Slash staff: speeddating"""
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
@@ -700,15 +657,8 @@ class SpeedCog(commands.Cog):
 
 # -------------------- Entrée --------------------
 bot = RencontreBot()
-speed = SpeedCog(bot)
-# Enregistrer la slash speeddating sur le guild (plus rapide)
-if GUILD_ID:
-    bot.tree.add_command(speed.speeddating, guild=discord.Object(id=GUILD_ID))
-else:
-    bot.tree.add_command(speed.speeddating)
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise SystemExit("DISCORD_TOKEN est requis (mets-le en variable d’environnement).")
     bot.run(DISCORD_TOKEN)
-

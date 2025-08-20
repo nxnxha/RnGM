@@ -1,13 +1,11 @@
-# miri_rencontre.py — Miri Rencontre (DM pas-à-pas, stable, reset admin)
+# miri_rencontre.py — Miri Rencontre (DM pas-à-pas, stable)
 # ✔ Formulaire en DM pas-à-pas (pas de Modal en DM → fini “Échec de l’interaction”)
-# ✔ ACK immédiat + edit (évite timeouts)
 # ✔ Vues persistantes restaurées au boot
-# ✔ /resetrencontre (admin), /resetprofil (user), /speeddating (staff)
-# ✔ /creerprofil (user), /sync (admin)
+# ✔ Slash: /resetprofil (user), /resetrencontre (admin), /speeddating (staff), /sync (admin)
 # ✔ Tinder: Like / Pass / Match (+ DM)
 # ✔ Logs horodatés [JJ/MM/AAAA HH:MM]
-# ✔ Rôle Accès Rencontre ajouté en sécurité
-# ✔ Slash commands scope serveur + sync agressive
+# ✔ Rôle Accès Rencontre
+# ✔ Sync slash agressive (setup_hook + on_ready + on_guild_available + délai)
 
 import os
 import re
@@ -29,7 +27,7 @@ def env_int(name: str, default: int) -> int:
         return default
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID      = env_int("GUILD_ID",      1382730341944397967)  # ton serveur
+GUILD_ID      = env_int("GUILD_ID",      1382730341944397967)  # TON SERVEUR
 ROLE_ACCESS   = env_int("ROLE_ACCESS",   1401403405729267762)
 CH_GIRLS      = env_int("CH_GIRLS",      1400520391793053841)
 CH_BOYS       = env_int("CH_BOYS",       1400520396557521058)
@@ -44,7 +42,7 @@ TZ = ZoneInfo("Europe/Paris")
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
-intents.message_content = True  # lire les DM (photo/lien)
+intents.message_content = True  # nécessaire pour lire les DM (photo/lien)
 
 # -------------------- Storage --------------------
 class Storage:
@@ -75,7 +73,6 @@ class Storage:
         except Exception:
             pass
 
-    # profiles
     def get_profile(self, uid: int) -> Optional[Dict[str, Any]]:
         return self.data["profiles"].get(str(uid))
 
@@ -84,28 +81,22 @@ class Storage:
         self.save()
 
     def delete_profile_everywhere(self, uid: int):
-        # Profil et références
         self.data["profiles"].pop(str(uid), None)
         self.data["profile_msgs"].pop(str(uid), None)
-        # Likes/Passes émis par l'utilisateur
         self.data["likes"].pop(str(uid), None)
         self.data["passes"].pop(str(uid), None)
 
-        # Nettoyer les compteurs de 1er message (émetteur ou cible)
+        # Nettoyage anti-spam 1er message (émetteur ou cible)
         fmc = self.data.get("first_msg_counts", {})
-        to_del = [k for k in list(fmc.keys()) if k.startswith(f"{uid}:") or k.endswith(f":{uid}")]
-        for k in to_del:
-            fmc.pop(k, None)
+        for k in list(fmc.keys()):
+            if k.startswith(f"{uid}:") or k.endswith(f":{uid}"):
+                fmc.pop(k, None)
 
-        # Matches
-        new_matches = []
-        for a, b in self.data["matches"]:
-            if int(a) != uid and int(b) != uid:
-                new_matches.append([a, b])
-        self.data["matches"] = new_matches
+        # Retire les matches impliquant l'user
+        self.data["matches"] = [[a, b] for a, b in self.data["matches"]
+                                if int(a) != uid and int(b) != uid]
         self.save()
 
-    # message refs
     def set_profile_msg(self, uid: int, channel_id: int, message_id: int):
         self.data["profile_msgs"][str(uid)] = {"channel_id": channel_id, "message_id": message_id}
         self.save()
@@ -113,7 +104,6 @@ class Storage:
     def get_profile_msg(self, uid: int) -> Optional[Dict[str, int]]:
         return self.data["profile_msgs"].get(str(uid))
 
-    # anti-spam contact
     def inc_first_msg(self, author_id: int, target_id: int) -> int:
         key = f"{author_id}:{target_id}"
         val = self.data["first_msg_counts"].get(key, 0) + 1
@@ -121,9 +111,8 @@ class Storage:
         self.save()
         return val
 
-    # tinder
     def like(self, user_id: int, target_id: int) -> bool:
-        if str(user_id) == str(target_id):
+        if user_id == target_id:
             return False
         likes = self.data["likes"].setdefault(str(user_id), [])
         if target_id not in likes:
@@ -146,7 +135,7 @@ class Storage:
 
 storage = Storage(DATA_FILE)
 
-# -------------------- Helpers --------------------
+# -------------------- Utils --------------------
 def now_ts() -> str:
     return datetime.now(TZ).strftime("[%d/%m/%Y %H:%M]")
 
@@ -165,10 +154,10 @@ def allowed_to_manage(inter: discord.Interaction, owner_id: int) -> bool:
     return False
 
 # -------------------- States --------------------
-awaiting_photo: Dict[int, Dict[str, Any]] = {}   # uid -> {"profile":..., "is_edit": bool}
-dm_sessions: Dict[int, Dict[str, Any]] = {}      # uid -> {step:int, is_edit:bool, answers:dict}
+awaiting_photo: Dict[int, Dict[str, Any]] = {}
+dm_sessions: Dict[int, Dict[str, Any]] = {}
 
-# -------------------- Views & Modals --------------------
+# -------------------- Views --------------------
 class StartFormView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -184,9 +173,9 @@ class StartFormView(discord.ui.View):
                     title="Création de ton profil — DM",
                     description=(
                         "On va remplir le formulaire en **privé**.\n\n"
-                        "👉 Clique sur **Démarrer** ci-dessous, puis réponds aux questions.\n"
-                        "Ensuite, **envoie une photo** (upload ou lien) dans ce DM.\n"
-                        "Je publierai ton profil et je te donnerai le **rôle Accès Rencontre** ✅"
+                        "👉 Clique sur **Démarrer**, réponds aux questions,\n"
+                        "puis **envoie une photo** (upload ou lien) dans ce DM.\n"
+                        "Je publierai ton profil et te donnerai le **rôle Accès Rencontre** ✅"
                     ),
                     color=discord.Color.purple()
                 ),
@@ -197,7 +186,7 @@ class StartFormView(discord.ui.View):
 
         try:
             await interaction.edit_original_response(
-                content=("📩 C’est bon ! Regarde tes DM pour créer ton profil." if ok
+                content=("📩 Regarde tes DM pour créer ton profil." if ok
                          else "⚠️ Impossible de t’écrire en DM (DM fermés ?).")
             )
         except Exception:
@@ -215,7 +204,7 @@ class StartDMFormView(discord.ui.View):
         dm_sessions[uid] = {"step": 0, "is_edit": self.is_edit, "answers": {}}
         await interaction.channel.send("1/5 — Quel est **ton âge** ? (nombre ≥ 18)")
 
-# -------------------- Profile View (sous chaque profil) --------------------
+# -------------------- Vue sous-profil --------------------
 class ProfileView(discord.ui.View):
     def __init__(self, owner_id: int):
         super().__init__(timeout=None)
@@ -224,15 +213,14 @@ class ProfileView(discord.ui.View):
     @discord.ui.button(emoji="❤️", label="Like", style=discord.ButtonStyle.success, custom_id="pf_like")
     async def like_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message("⏳ Je note ton like…", ephemeral=True)
-        author = interaction.user
-        if author.id == self.owner_id:
+        if interaction.user.id == self.owner_id:
             await interaction.edit_original_response(content="🤨 Tu ne peux pas te liker toi-même.")
             return
-        is_match = storage.like(author.id, self.owner_id)
-        log_line(interaction.guild, f"❤️ Like : {author} ({author.id}) → {self.owner_id}")
+        is_match = storage.like(interaction.user.id, self.owner_id)
+        log_line(interaction.guild, f"❤️ Like : {interaction.user} ({interaction.user.id}) → {self.owner_id}")
         await interaction.edit_original_response(content="❤️ Like enregistré.")
         if is_match:
-            a = interaction.guild.get_member(author.id)
+            a = interaction.guild.get_member(interaction.user.id)
             b = interaction.guild.get_member(self.owner_id)
             for m1, m2 in [(a, b), (b, a)]:
                 try:
@@ -245,12 +233,11 @@ class ProfileView(discord.ui.View):
     @discord.ui.button(emoji="❌", label="Pass", style=discord.ButtonStyle.secondary, custom_id="pf_pass")
     async def pass_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message("⏳ Je note ton pass…", ephemeral=True)
-        author = interaction.user
-        if author.id == self.owner_id:
+        if interaction.user.id == self.owner_id:
             await interaction.edit_original_response(content="… Pourquoi passer sur toi-même ? 😅")
             return
-        storage.pass_(author.id, self.owner_id)
-        log_line(interaction.guild, f"❌ Pass : {author} ({author.id}) → {self.owner_id}")
+        storage.pass_(interaction.user.id, self.owner_id)
+        log_line(interaction.guild, f"❌ Pass : {interaction.user} ({interaction.user.id}) → {self.owner_id}")
         await interaction.edit_original_response(content="👌 C’est noté.")
 
     @discord.ui.button(emoji="📩", label="Contacter", style=discord.ButtonStyle.primary, custom_id="pf_contact")
@@ -328,7 +315,7 @@ class ProfileView(discord.ui.View):
         log_line(interaction.guild, f"🗑️ Suppression : {member} ({member.id})")
         await interaction.edit_original_response(content="✅ Profil supprimé.")
 
-# -------------------- Helpers profils --------------------
+# -------------------- Embeds & publication --------------------
 def build_profile_embed(member: discord.Member, prof: Dict[str, Any]) -> discord.Embed:
     e = discord.Embed(
         title=f"Profil de {member.display_name}",
@@ -338,14 +325,13 @@ def build_profile_embed(member: discord.Member, prof: Dict[str, Any]) -> discord
     e.set_author(name=str(member), icon_url=member.display_avatar.url if member.display_avatar else None)
     if prof.get("photo_url"):
         e.set_thumbnail(url=prof["photo_url"])
-    fields = [
+    for n, v, inline in [
         ("Âge", f"{prof.get('age', '—')}", True),
         ("Genre", prof.get('genre', '—') or "—", True),
         ("Attirance", prof.get('orientation', '—') or "—", True),
         ("Passions", prof.get('passions', '—') or "—", False),
         ("Activité", prof.get('activite', '—') or "—", False),
-    ]
-    for n, v, inline in fields:
+    ]:
         e.add_field(name=n, value=v, inline=inline)
     e.set_footer(text="❤️ Like  •  ❌ Pass  •  📩 Contacter  •  ✏️ Modifier  •  🗑️ Supprimer")
     return e
@@ -375,9 +361,8 @@ async def publish_or_update_profile(guild: discord.Guild, member: discord.Member
     msg = await ch.send(embed=embed, view=view)
     storage.set_profile_msg(member.id, ch.id, msg.id)
 
-# -------------------- COGS: Admin, User & Staff --------------------
+# -------------------- Slash COGS --------------------
 class AdminCog(commands.Cog, name="Admin"):
-    """Slash admin/user: resetrencontre, resetprofil, sync"""
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
@@ -388,7 +373,6 @@ class AdminCog(commands.Cog, name="Admin"):
         try:
             if os.path.exists(DATA_FILE):
                 os.remove(DATA_FILE)
-            # reset en mémoire
             storage.data = {
                 "profiles": {},
                 "profile_msgs": {},
@@ -401,7 +385,7 @@ class AdminCog(commands.Cog, name="Admin"):
             await interaction.response.send_message(
                 "✅ Données Rencontre **réinitialisées**.\n"
                 "• Les anciens messages de profils n’ont plus de boutons valides (supprime-les si besoin).\n"
-                "• Les membres peuvent recréer via le bouton ou `/creerprofil`.",
+                "• Les membres utilisent le **bouton** pour (re)créer le profil.",
                 ephemeral=True
             )
             log_line(interaction.guild, f"🗑️ Reset Rencontre (complet) par {interaction.user} ({interaction.user.id})")
@@ -416,7 +400,7 @@ class AdminCog(commands.Cog, name="Admin"):
         storage.delete_profile_everywhere(uid)
         if had:
             await interaction.response.send_message(
-                "🗑️ Ton profil a été supprimé. Utilise le bouton **Créer mon profil** ou `/creerprofil` pour recommencer.",
+                "🗑️ Ton profil a été supprimé. Utilise le **bouton** pour recommencer.",
                 ephemeral=True
             )
             log_line(interaction.guild, f"🗑️ Profil reset par {interaction.user} ({interaction.user.id})")
@@ -424,7 +408,7 @@ class AdminCog(commands.Cog, name="Admin"):
             await interaction.response.send_message("ℹ️ Tu n’avais pas encore de profil enregistré.", ephemeral=True)
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.command(name="sync", description="Force la synchronisation des commandes slash (admin).")
+    @app_commands.command(name="sync", description="Force la synchronisation des commandes slash (admin)")
     @app_commands.checks.has_permissions(administrator=True)
     async def sync_cmds(self, interaction: discord.Interaction):
         try:
@@ -433,40 +417,12 @@ class AdminCog(commands.Cog, name="Admin"):
         except Exception as e:
             await interaction.response.send_message(f"⚠️ Sync fail : {e}", ephemeral=True)
 
-class UserCog(commands.Cog, name="User"):
-    """Slash user: creerprofil"""
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.command(name="creerprofil", description="Ouvre un DM pour créer ton profil.")
-    async def creer_profil(self, interaction: discord.Interaction):
-        try:
-            await interaction.response.send_message("⏳ J’ouvre un DM avec toi…", ephemeral=True)
-            dm = await interaction.user.create_dm()
-            await dm.send(
-                embed=discord.Embed(
-                    title="Création de ton profil — DM",
-                    description=(
-                        "On remplit en **privé**.\n\n"
-                        "👉 Clique **Démarrer**, réponds aux questions puis **envoie une photo** (upload ou lien).\n"
-                        "Je publierai ton profil et te donnerai le **rôle Accès Rencontre** ✅"
-                    ),
-                    color=discord.Color.purple()
-                ),
-                view=StartDMFormView(is_edit=False)
-            )
-            await interaction.edit_original_response(content="📩 DM envoyé !")
-        except Exception:
-            await interaction.edit_original_response(content="⚠️ Impossible d’écrire en DM (DM fermés ?).")
-
 class SpeedCog(commands.Cog, name="SpeedDating"):
-    """Slash staff: speeddating"""
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.command(name="speeddating", description="Crée des threads privés éphémères (staff).")
+    @app_commands.command(name="speeddating", description="Crée des threads privés éphémères (staff)")
     @app_commands.checks.has_permissions(manage_channels=True)
     async def speeddating(self, interaction: discord.Interaction, couples: int = 5):
         if not CH_SPEED:
@@ -538,37 +494,56 @@ class RencontreBot(commands.Bot):
         self.synced = False
 
     async def setup_hook(self):
-        # Vues persistantes globales
+        # Vues persistantes
         self.add_view(StartFormView())
         self.add_view(StartDMFormView(is_edit=False))
         self.add_view(StartDMFormView(is_edit=True))
 
-        # 🔁 Restaurer les vues des profils publiés (après reboot)
+        # Restaurer les vues des profils
         try:
             for uid_str, ref in storage.data.get("profile_msgs", {}).items():
                 owner_id = int(uid_str)
-                message_id = int(ref.get("message_id", 0))
-                if message_id:
-                    self.add_view(ProfileView(owner_id=owner_id), message_id=message_id)
+                mid = int(ref.get("message_id", 0))
+                if mid:
+                    self.add_view(ProfileView(owner_id=owner_id), message_id=mid)
         except Exception as e:
             print("[Persistent views restore error]", e)
 
-        # Cogs (slash commands)
+        # Cogs
         self.add_cog(AdminCog(self))
-        self.add_cog(UserCog(self))
         self.add_cog(SpeedCog(self))
 
-        # (On ne sync pas ici définitivement : certains hosts chargent avant que le guild soit prêt)
+        # 🔥 SYNC forte ici aussi
+        try:
+            if GUILD_ID:
+                cmds = await self.tree.sync(guild=discord.Object(id=GUILD_ID))
+                print(f"[SYNC-setup_hook] {len(cmds)} commandes sync")
+                self.synced = True
+        except Exception as e:
+            print("[Slash sync setup_hook error]", e)
+
+        # back-off: sync différée
+        asyncio.create_task(self._delayed_sync())
+
+    async def _delayed_sync(self):
+        await asyncio.sleep(3)
+        try:
+            if GUILD_ID:
+                cmds = await self.tree.sync(guild=discord.Object(id=GUILD_ID))
+                print(f"[SYNC-delayed] {len(cmds)} commandes sync")
+                self.synced = True
+        except Exception as e:
+            print("[Slash sync delayed error]", e)
 
     async def on_ready(self):
         print(f"✅ Connecté en tant que {self.user} ({self.user.id})")
-        # Sync agressive dès que possible
+        # Sync encore ici (au cas où)
         try:
             if GUILD_ID:
                 guild = self.get_guild(GUILD_ID)
                 if guild:
                     cmds = await self.tree.sync(guild=discord.Object(id=GUILD_ID))
-                    print(f"[SYNC] {len(cmds)} commandes sync sur {guild.name}")
+                    print(f"[SYNC-on_ready] {len(cmds)} commandes sync sur {guild.name}")
                     self.synced = True
         except Exception as e:
             print("[Slash sync on_ready error]", e)
@@ -594,7 +569,6 @@ class RencontreBot(commands.Bot):
                     pass
 
     async def on_guild_available(self, guild: discord.Guild):
-        # si le guild devient dispo après le boot, (re)sync
         if GUILD_ID and guild.id == GUILD_ID and not self.synced:
             try:
                 cmds = await self.tree.sync(guild=discord.Object(id=GUILD_ID))
@@ -619,8 +593,6 @@ class RencontreBot(commands.Bot):
         # --- Formulaire DM pas-à-pas ---
         if isinstance(message.channel, discord.DMChannel):
             uid = message.author.id
-
-            # 1) session de formulaire
             if uid in dm_sessions:
                 s = dm_sessions[uid]
                 step = s["step"]
@@ -657,7 +629,6 @@ class RencontreBot(commands.Bot):
 
                     if step == 4:
                         s["answers"]["activite"] = "" if content.lower()=="skip" else content
-                        # terminé → demande photo
                         is_edit = s["is_edit"]
                         answers = s["answers"]
                         dm_sessions.pop(uid, None)
@@ -675,7 +646,7 @@ class RencontreBot(commands.Bot):
                         }
                         awaiting_photo[uid] = {"profile": profile, "is_edit": is_edit}
                         await message.channel.send(
-                            "✅ Formulaire reçu ! Maintenant, **envoie une photo** (upload ou lien). "
+                            "✅ Formulaire reçu ! Maintenant, **envoie une photo** (upload ou lien).\n"
                             "Tu peux répondre `skip` pour ne pas mettre/changer la photo."
                         )
                         return
@@ -684,7 +655,7 @@ class RencontreBot(commands.Bot):
                     await message.channel.send("⚠️ Donne un **nombre** pour l’âge (ex: 22).")
                     return
 
-            # 2) réception de la photo (ou skip)
+            # Réception de la photo (ou skip)
             if uid in awaiting_photo:
                 photo_url = None
                 if message.attachments:
@@ -716,7 +687,6 @@ class RencontreBot(commands.Bot):
                 storage.set_profile(uid, prof)
                 await publish_or_update_profile(guild, member, prof)
 
-                # donner le rôle accès si création — sécurisé
                 if not is_edit and ROLE_ACCESS:
                     role = guild.get_role(ROLE_ACCESS)
                     if role:

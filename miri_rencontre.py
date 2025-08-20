@@ -3,9 +3,12 @@
 # ✔ ACK immédiat + edit (évite timeouts)
 # ✔ Vues persistantes restaurées au boot
 # ✔ /resetrencontre (admin), /resetprofil (user), /speeddating (staff)
+# ✔ /creerprofil (user), /editprofil (user)
 # ✔ Tinder: Like / Pass / Match (+ DM)
 # ✔ Logs horodatés [JJ/MM/AAAA HH:MM]
 # ✔ Rôle Accès Rencontre ajouté en sécurité
+# ✔ Slash commands scopées au serveur (apparition immédiate)
+# ✔ Suppression nettoie aussi first_msg_counts (recréation possible)
 
 import os
 import re
@@ -82,10 +85,27 @@ class Storage:
         self.save()
 
     def delete_profile_everywhere(self, uid: int):
+        # Profil et références
         self.data["profiles"].pop(str(uid), None)
         self.data["profile_msgs"].pop(str(uid), None)
+        # Likes/Passes émis par l'utilisateur
         self.data["likes"].pop(str(uid), None)
         self.data["passes"].pop(str(uid), None)
+        # PATCH: retirer uid des likes/passes des autres si tu veux “purifier” totalement:
+        # for k in list(self.data["likes"].keys()):
+        #     if uid in self.data["likes"][k]:
+        #         self.data["likes"][k].remove(uid)
+        # for k in list(self.data["passes"].keys()):
+        #     if uid in self.data["passes"][k]:
+        #         self.data["passes"][k].remove(uid)
+
+        # PATCH: nettoyer les compteurs de 1er message où l'user est émetteur ou cible
+        fmc = self.data.get("first_msg_counts", {})
+        to_del = [k for k in list(fmc.keys()) if k.startswith(f"{uid}:") or k.endswith(f":{uid}")]
+        for k in to_del:
+            fmc.pop(k, None)
+
+        # matches
         new_matches = []
         for a, b in self.data["matches"]:
             if int(a) != uid and int(b) != uid:
@@ -243,7 +263,6 @@ class ProfileView(discord.ui.View):
 
     @discord.ui.button(emoji="📩", label="Contacter", style=discord.ButtonStyle.primary, custom_id="pf_contact")
     async def contact_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # petite modal pour le 1er message fonctionne bien en guild; en DM on n’en a pas besoin
         class ContactModal(discord.ui.Modal, title="Premier message"):
             def __init__(self, target_id: int):
                 super().__init__(timeout=300)
@@ -388,9 +407,10 @@ class RencontreBot(commands.Bot):
 
         # Cogs (slash commands)
         self.add_cog(AdminCog(self))
+        self.add_cog(UserCog(self))     # PATCH: nouveau cog user
         self.add_cog(SpeedCog(self))
 
-        # Sync des slash sur le guild (plus rapide)
+        # Sync des slash sur le guild (plus rapide & immédiat)
         try:
             if GUILD_ID:
                 await self.tree.sync(guild=discord.Object(id=GUILD_ID))
@@ -556,12 +576,13 @@ class RencontreBot(commands.Bot):
                     log_line(guild, f"✅ Création profil : {member} ({member.id})")
                     await message.channel.send("✅ Profil créé. Bienvenue dans l’Espace Rencontre !")
 
-# -------------------- COGS: Admin & Staff --------------------
+# -------------------- COGS: Admin, User & Staff --------------------
 class AdminCog(commands.Cog, name="Admin"):
     """Slash admin/user: resetrencontre, resetprofil"""
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    @app_commands.guilds(discord.Object(id=GUILD_ID))  # scope serveur
     @app_commands.command(name="resetrencontre", description="⚠️ Réinitialise complètement tous les profils Rencontre (admin)")
     @app_commands.checks.has_permissions(administrator=True)
     async def reset_rencontre(self, interaction: discord.Interaction):
@@ -581,13 +602,14 @@ class AdminCog(commands.Cog, name="Admin"):
             await interaction.response.send_message(
                 "✅ Données Rencontre **réinitialisées**.\n"
                 "• Les anciens messages de profils n’ont plus de boutons valides (supprime-les si besoin).\n"
-                "• Les membres peuvent recréer leur profil via le bouton.",
+                "• Les membres peuvent recréer leur profil via le bouton ou /creerprofil.",
                 ephemeral=True
             )
             log_line(interaction.guild, f"🗑️ Reset Rencontre (complet) par {interaction.user} ({interaction.user.id})")
         except Exception as e:
             await interaction.response.send_message(f"⚠️ Erreur pendant le reset : {e}", ephemeral=True)
 
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="resetprofil", description="🗑️ Supprime ton propre profil Rencontre")
     async def reset_profil(self, interaction: discord.Interaction):
         uid = interaction.user.id
@@ -595,18 +617,57 @@ class AdminCog(commands.Cog, name="Admin"):
         storage.delete_profile_everywhere(uid)
         if had:
             await interaction.response.send_message(
-                "🗑️ Ton profil a été supprimé. Utilise le bouton **Créer mon profil** pour recommencer.",
+                "🗑️ Ton profil a été supprimé. Utilise le bouton **Créer mon profil** ou `/creerprofil` pour recommencer.",
                 ephemeral=True
             )
             log_line(interaction.guild, f"🗑️ Profil reset par {interaction.user} ({interaction.user.id})")
         else:
             await interaction.response.send_message("ℹ️ Tu n’avais pas encore de profil enregistré.", ephemeral=True)
 
+class UserCog(commands.Cog, name="User"):
+    """Slash user: creerprofil, editprofil"""
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    @app_commands.command(name="creerprofil", description="Ouvre un DM pour créer ton profil.")
+    async def creer_profil(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.send_message("⏳ J’ouvre un DM avec toi…", ephemeral=True)
+            dm = await interaction.user.create_dm()
+            await dm.send(
+                embed=discord.Embed(
+                    title="Création de ton profil — DM",
+                    description=(
+                        "On remplit en **privé**.\n\n"
+                        "👉 Clique **Démarrer**, réponds aux questions puis **envoie une photo** (upload ou lien).\n"
+                        "Je publierai ton profil et te donnerai le **rôle Accès Rencontre** ✅"
+                    ),
+                    color=discord.Color.purple()
+                ),
+                view=StartDMFormView(is_edit=False)
+            )
+            await interaction.edit_original_response(content="📩 DM envoyé !")
+        except Exception:
+            await interaction.edit_original_response(content="⚠️ Impossible d’écrire en DM (DM fermés ?).")
+
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    @app_commands.command(name="editprofil", description="Ouvre un DM pour modifier ton profil.")
+    async def edit_profil(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.send_message("⏳ J’ouvre un DM pour modifier ton profil…", ephemeral=True)
+            dm = await interaction.user.create_dm()
+            await dm.send("✏️ On modifie ton profil ici. Clique **Démarrer** :", view=StartDMFormView(is_edit=True))
+            await interaction.edit_original_response(content="📩 DM envoyé !")
+        except Exception:
+            await interaction.edit_original_response(content="⚠️ Impossible d’écrire en DM (DM fermés ?).")
+
 class SpeedCog(commands.Cog, name="SpeedDating"):
     """Slash staff: speeddating"""
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="speeddating", description="Crée des threads privés éphémères (staff).")
     @app_commands.checks.has_permissions(manage_channels=True)
     async def speeddating(self, interaction: discord.Interaction, couples: int = 5):

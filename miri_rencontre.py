@@ -1,4 +1,4 @@
-# miri_rencontre.py — HARD SYNC (guild + global) + /ping de test (SLASH-ONLY + GUILD-SCOPED)
+# miri_rencontre.py — HARD SYNC (guild + global) + HARD RESET + /ping (SLASH-ONLY + GUILD-SCOPED)
 import os, re, json, asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List, Tuple
@@ -342,48 +342,80 @@ class DiagCog(commands.Cog, name="Diag"):
 # -------------------- BOT --------------------
 class RencontreBot(commands.Bot):
     def __init__(self):
-        # Pas de commandes texte: on ne traitera pas process_commands (slash-only)
+        # Pas de commandes texte: on ne traite pas process_commands (slash-only)
         super().__init__(command_prefix="!", intents=intents, help_command=None)
         self.synced=False
 
+    # ------------ setup_hook avec HARD RESET + REPUBLISH ------------
     async def setup_hook(self):
         # Vues persistantes
-        self.add_view(StartFormView()); self.add_view(StartDMFormView(is_edit=False)); self.add_view(StartDMFormView(is_edit=True))
+        self.add_view(StartFormView())
+        self.add_view(StartDMFormView(is_edit=False))
+        self.add_view(StartDMFormView(is_edit=True))
         # Restaurer vues profils
         try:
             for uid_str, ref in storage.data.get("profile_msgs", {}).items():
-                mid=int(ref.get("message_id",0))
-                if mid: self.add_view(ProfileView(owner_id=int(uid_str)), message_id=mid)
-        except Exception as e: print("[Persistent views restore error]", e)
-        # Cogs
-        self.add_cog(AdminCog(self)); self.add_cog(SpeedCog(self)); self.add_cog(DiagCog(self))
-
-        # —— HARD SYNC: 1) GLOBAL, 2) copy → GUILD, 3) resync guild (apparition immédiate)
-        try:
-            cmds_glob = await self.tree.sync()
-            print(f"[SYNC global] {len(cmds_glob)} cmds")
+                mid = int(ref.get("message_id", 0))
+                if mid:
+                    self.add_view(ProfileView(owner_id=int(uid_str)), message_id=mid)
         except Exception as e:
-            print("[SYNC global ERROR]", e)
+            print("[Persistent views restore error]", e)
+
+        # Cogs (enregistrent les commandes)
+        self.add_cog(AdminCog(self))
+        self.add_cog(SpeedCog(self))
+        self.add_cog(DiagCog(self))
+
+        # ---------- DIAG ----------
+        print("discord.py version:", discord.__version__)
+        print("Guilds du bot:", [(g.name, g.id) for g in self.guilds])
+
+        g = GUILD_OBJ
+
+        # ---------- HARD RESET GUILD ----------
         try:
-            if GUILD_ID:
-                self.tree.copy_global_to(guild=GUILD_OBJ)
-                cmds_g = await self.tree.sync(guild=GUILD_OBJ)
-                print(f"[SYNC guild] {len(cmds_g)} cmds (copied from global)")
-                self.synced=True
+            print("[CLEAR] purge des commandes GUILD…")
+            self.tree.clear_commands(guild=g)      # vide le cache local des cmds scopées guild
+            await self.tree.sync(guild=g)          # pousse le 'vide' côté Discord
+            print("[CLEAR] OK")
+        except Exception as e:
+            print("[CLEAR ERROR]", e)
+
+        # ---------- PUBLISH PROPRE ----------
+        try:
+            # (optionnel) sync global
+            try:
+                gl = await self.tree.sync()
+                print(f"[SYNC global] {len(gl)} cmds")
+            except Exception as e:
+                print("[SYNC global ERROR]", e)
+
+            # copie → guild et publication immédiate
+            self.tree.copy_global_to(guild=g)
+            gg = await self.tree.sync(guild=g)
+            print(f"[SYNC guild] {len(gg)} cmds")
+
+            fetched = await self.tree.fetch_commands(guild=g)
+            print("[FETCH guild]", [c.name for c in fetched])
+
+            self.synced = True
         except Exception as e:
             print("[SYNC guild ERROR]", e)
+            self.synced = False
 
+    # ------------ on_ready (resync de sûreté) ------------
     async def on_ready(self):
         print(f"✅ Connecté en tant que {self.user} ({self.user.id})")
-        # Redondance: resync guild au cas où
         try:
-            if GUILD_ID:
-                cmds_g = await self.tree.sync(guild=GUILD_OBJ)
-                print(f"[SYNC on_ready] {len(cmds_g)} cmds")
-                self.synced=True
+            gg = await self.tree.sync(guild=GUILD_OBJ)
+            print(f"[SYNC on_ready] {len(gg)} cmds")
+            fetched = await self.tree.fetch_commands(guild=GUILD_OBJ)
+            print("[FETCH on_ready guild]", [c.name for c in fetched])
+            self.synced = True
         except Exception as e:
             print("[SYNC on_ready ERROR]", e)
 
+        # Panneau d'accueil
         if CH_WELCOME:
             ch=self.get_channel(CH_WELCOME)
             if isinstance(ch, discord.TextChannel):

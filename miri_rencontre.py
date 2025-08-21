@@ -1,4 +1,4 @@
-# miri_rencontre.py — HARD SYNC (guild + global) + /ping de test
+# miri_rencontre.py — HARD SYNC (guild + global) + /ping de test (SLASH-ONLY + GUILD-SCOPED)
 import os, re, json, asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List, Tuple
@@ -235,11 +235,15 @@ async def publish_or_update_profile(guild: discord.Guild, member: discord.Member
     if not isinstance(ch, discord.TextChannel): return
     msg=await ch.send(embed=embed, view=view); storage.set_profile_msg(member.id, ch.id, msg.id)
 
-# -------------------- Slash COGS (définies SANS scope → global + on les sync aussi au guild) --------------------
+# -------------- GUILD OBJECT (pour scoper toutes les slash) --------------
+GUILD_OBJ = discord.Object(id=GUILD_ID)
+
+# -------------------- Slash COGS --------------------
 class AdminCog(commands.Cog, name="Admin"):
     def __init__(self, bot: commands.Bot): self.bot=bot
 
     @app_commands.command(name="resetrencontre", description="⚠️ Réinitialise complètement tous les profils Rencontre (admin)")
+    @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(administrator=True)
     async def reset_rencontre(self, interaction: discord.Interaction):
         try:
@@ -257,6 +261,7 @@ class AdminCog(commands.Cog, name="Admin"):
             await interaction.response.send_message(f"⚠️ Erreur pendant le reset : {e}", ephemeral=True)
 
     @app_commands.command(name="resetprofil", description="🗑️ Supprime ton propre profil Rencontre")
+    @app_commands.guilds(GUILD_OBJ)
     async def reset_profil(self, interaction: discord.Interaction):
         uid=interaction.user.id; had=storage.get_profile(uid) is not None
         storage.delete_profile_everywhere(uid)
@@ -267,13 +272,13 @@ class AdminCog(commands.Cog, name="Admin"):
             await interaction.response.send_message("ℹ️ Tu n’avais pas encore de profil enregistré.", ephemeral=True)
 
     @app_commands.command(name="sync", description="Force la synchronisation des commandes slash (admin)")
+    @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(administrator=True)
     async def sync_cmds(self, interaction: discord.Interaction):
-        gobj = discord.Object(id=GUILD_ID)
+        gobj = GUILD_OBJ
         try:
             before_g = await interaction.client.tree.fetch_commands(guild=gobj)
             before_glob = await interaction.client.tree.fetch_commands()
-            # copie global -> guild (assure présence immédiate)
             interaction.client.tree.copy_global_to(guild=gobj)
             cmds = await interaction.client.tree.sync(guild=gobj)
             after_g = await interaction.client.tree.fetch_commands(guild=gobj)
@@ -287,7 +292,9 @@ class AdminCog(commands.Cog, name="Admin"):
 
 class SpeedCog(commands.Cog, name="SpeedDating"):
     def __init__(self, bot: commands.Bot): self.bot=bot
+
     @app_commands.command(name="speeddating", description="Crée des threads privés éphémères (staff)")
+    @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(manage_channels=True)
     async def speeddating(self, interaction: discord.Interaction, couples:int=5):
         if not CH_SPEED: await interaction.response.send_message("❌ CH_SPEED non défini.", ephemeral=True); return
@@ -325,17 +332,18 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
             try: await t.edit(archived=True, locked=True)
             except Exception: pass
 
-# Diag minimal (toujours utile)
 class DiagCog(commands.Cog, name="Diag"):
     def __init__(self, bot: commands.Bot): self.bot=bot
     @app_commands.command(name="ping", description="Test de présence des commandes")
+    @app_commands.guilds(GUILD_OBJ)
     async def ping(self, interaction: discord.Interaction):
         await interaction.response.send_message("pong ✅", ephemeral=True)
 
 # -------------------- BOT --------------------
 class RencontreBot(commands.Bot):
     def __init__(self):
-        super().__init__(command_prefix="!", intents=intents)
+        # Pas de commandes texte: on ne traitera pas process_commands (slash-only)
+        super().__init__(command_prefix="!", intents=intents, help_command=None)
         self.synced=False
 
     async def setup_hook(self):
@@ -350,21 +358,16 @@ class RencontreBot(commands.Bot):
         # Cogs
         self.add_cog(AdminCog(self)); self.add_cog(SpeedCog(self)); self.add_cog(DiagCog(self))
 
-        # —— HARD SYNC: 1) enregistrer en GLOBAL, 2) copier vers le GUILD, 3) resync guild
+        # —— HARD SYNC: 1) GLOBAL, 2) copy → GUILD, 3) resync guild (apparition immédiate)
         try:
-            # 1) Sync GLOBAL (les commandes existent dans l’app)
             cmds_glob = await self.tree.sync()
             print(f"[SYNC global] {len(cmds_glob)} cmds")
         except Exception as e:
             print("[SYNC global ERROR]", e)
-
         try:
             if GUILD_ID:
-                gobj = discord.Object(id=GUILD_ID)
-                # 2) Copier toutes les commandes globales VERS le guild
-                self.tree.copy_global_to(guild=gobj)
-                # 3) Sync GUILD (apparition immédiate)
-                cmds_g = await self.tree.sync(guild=gobj)
+                self.tree.copy_global_to(guild=GUILD_OBJ)
+                cmds_g = await self.tree.sync(guild=GUILD_OBJ)
                 print(f"[SYNC guild] {len(cmds_g)} cmds (copied from global)")
                 self.synced=True
         except Exception as e:
@@ -375,7 +378,7 @@ class RencontreBot(commands.Bot):
         # Redondance: resync guild au cas où
         try:
             if GUILD_ID:
-                cmds_g = await self.tree.sync(guild=discord.Object(id=GUILD_ID))
+                cmds_g = await self.tree.sync(guild=GUILD_OBJ)
                 print(f"[SYNC on_ready] {len(cmds_g)} cmds")
                 self.synced=True
         except Exception as e:
@@ -401,7 +404,7 @@ class RencontreBot(commands.Bot):
     async def on_guild_available(self, guild: discord.Guild):
         if GUILD_ID and guild.id==GUILD_ID and not self.synced:
             try:
-                cmds_g = await self.tree.sync(guild=discord.Object(id=GUILD_ID))
+                cmds_g = await self.tree.sync(guild=GUILD_OBJ)
                 print(f"[SYNC guild_available] {len(cmds_g)} cmds")
                 self.synced=True
             except Exception as e:
@@ -415,6 +418,7 @@ class RencontreBot(commands.Bot):
 
     async def on_message(self, message: discord.Message):
         if message.author.bot: return
+        # NOTE: pas de process_commands ici -> SLASH-ONLY garanti
         # DM form
         if isinstance(message.channel, discord.DMChannel):
             uid=message.author.id

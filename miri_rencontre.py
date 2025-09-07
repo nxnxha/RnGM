@@ -1,4 +1,4 @@
-# miri_rencontre.py — HARD SYNC (guild + global) + HARD RESET + /ping (SLASH-ONLY + GUILD-SCOPED)
+# miri_rencontre.py — HYBRID SYNC (global + guild copy) + HARD RESET + /ping
 import os, re, json, asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List, Tuple
@@ -216,7 +216,7 @@ def build_profile_embed(member: discord.Member, prof: Dict[str, Any])->discord.E
                        ("Passions",prof.get('passions','—') or "—",False),
                        ("Activité",prof.get('activite','—') or "—",False)]:
         e.add_field(name=n, value=v, inline=inline)
-    e.set_footer(text="❤️ Like  •  ❌ Pass  •  📩 Contacter  •  ✏️ Modifier  •  🗑️ Supprimer")
+    e.set_footer(text="❤️ Like • ❌ Pass • 📩 Contacter • ✏️ Modifier • 🗑️ Supprimer")
     return e
 
 def target_channel_for(guild: discord.Guild, prof: Dict[str, Any])->Optional[discord.TextChannel]:
@@ -235,7 +235,7 @@ async def publish_or_update_profile(guild: discord.Guild, member: discord.Member
     if not isinstance(ch, discord.TextChannel): return
     msg=await ch.send(embed=embed, view=view); storage.set_profile_msg(member.id, ch.id, msg.id)
 
-# -------------- GUILD OBJECT (pour scoper toutes les slash) --------------
+# -------------- GUILD OBJECT (utilisé pour copy_global_to) --------------
 GUILD_OBJ = discord.Object(id=GUILD_ID)
 
 # -------------------- Slash COGS --------------------
@@ -243,7 +243,6 @@ class AdminCog(commands.Cog, name="Admin"):
     def __init__(self, bot: commands.Bot): self.bot=bot
 
     @app_commands.command(name="resetrencontre", description="⚠️ Réinitialise complètement tous les profils Rencontre (admin)")
-    @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(administrator=True)
     async def reset_rencontre(self, interaction: discord.Interaction):
         try:
@@ -261,7 +260,6 @@ class AdminCog(commands.Cog, name="Admin"):
             await interaction.response.send_message(f"⚠️ Erreur pendant le reset : {e}", ephemeral=True)
 
     @app_commands.command(name="resetprofil", description="🗑️ Supprime ton propre profil Rencontre")
-    @app_commands.guilds(GUILD_OBJ)
     async def reset_profil(self, interaction: discord.Interaction):
         uid=interaction.user.id; had=storage.get_profile(uid) is not None
         storage.delete_profile_everywhere(uid)
@@ -271,21 +269,18 @@ class AdminCog(commands.Cog, name="Admin"):
         else:
             await interaction.response.send_message("ℹ️ Tu n’avais pas encore de profil enregistré.", ephemeral=True)
 
-    @app_commands.command(name="sync", description="Force la synchronisation des commandes slash (admin)")
-    @app_commands.guilds(GUILD_OBJ)
+    @app_commands.command(name="sync", description="Force la synchronisation des commandes (admin)")
     @app_commands.checks.has_permissions(administrator=True)
     async def sync_cmds(self, interaction: discord.Interaction):
-        gobj = GUILD_OBJ
         try:
-            before_g = await interaction.client.tree.fetch_commands(guild=gobj)
-            before_glob = await interaction.client.tree.fetch_commands()
-            interaction.client.tree.copy_global_to(guild=gobj)
-            cmds = await interaction.client.tree.sync(guild=gobj)
-            after_g = await interaction.client.tree.fetch_commands(guild=gobj)
-            after_glob = await interaction.client.tree.fetch_commands()
+            client: commands.Bot = interaction.client
+            # copie des globales vers le guild pour un effet immédiat
+            client.tree.copy_global_to(guild=GUILD_OBJ)
+            g = await client.tree.sync(guild=GUILD_OBJ)
+            # sync globales (propagation plus lente, mais prête pour multi-serveurs)
+            glob = await client.tree.sync()
             await interaction.response.send_message(
-                f"🔁 Sync OK.\nGuild: {len(before_g)} → {len(after_g)}\nGlobal: {len(before_glob)} → {len(after_glob)}",
-                ephemeral=True
+                f"🔁 Sync OK — Guild:{len(g)} Global:{len(glob)}", ephemeral=True
             )
         except Exception as e:
             await interaction.response.send_message(f"⚠️ Sync fail : {e}", ephemeral=True)
@@ -294,7 +289,6 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
     def __init__(self, bot: commands.Bot): self.bot=bot
 
     @app_commands.command(name="speeddating", description="Crée des threads privés éphémères (staff)")
-    @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(manage_channels=True)
     async def speeddating(self, interaction: discord.Interaction, couples:int=5):
         if not CH_SPEED: await interaction.response.send_message("❌ CH_SPEED non défini.", ephemeral=True); return
@@ -335,179 +329,49 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
 class DiagCog(commands.Cog, name="Diag"):
     def __init__(self, bot: commands.Bot): self.bot=bot
     @app_commands.command(name="ping", description="Test de présence des commandes")
-    @app_commands.guilds(GUILD_OBJ)
     async def ping(self, interaction: discord.Interaction):
         await interaction.response.send_message("pong ✅", ephemeral=True)
 
 # -------------------- BOT --------------------
 class RencontreBot(commands.Bot):
     def __init__(self):
-        # Pas de commandes texte: on ne traite pas process_commands (slash-only)
+        # Pas de commandes texte : slash-only
         super().__init__(command_prefix="!", intents=intents, help_command=None)
-        self.synced=False
+        self.synced = False  # évite de sync plusieurs fois
 
-    # ------------ setup_hook avec HARD RESET + REPUBLISH ------------
     async def setup_hook(self):
-        # Vues persistantes
+        # Charger les Cogs
+        await self.add_cog(AdminCog(self))
+        await self.add_cog(SpeedCog(self))
+        await self.add_cog(DiagCog(self))
+
+        # Vues persistantes (custom_id fixes)
+        # ⚠️ Ne pas enregistrer ProfileView ici (owner_id dynamique)
         self.add_view(StartFormView())
-        self.add_view(StartDMFormView(is_edit=False))
-        self.add_view(StartDMFormView(is_edit=True))
-        # Restaurer vues profils
-        try:
-            for uid_str, ref in storage.data.get("profile_msgs", {}).items():
-                mid = int(ref.get("message_id", 0))
-                if mid:
-                    self.add_view(ProfileView(owner_id=int(uid_str)), message_id=mid)
-        except Exception as e:
-            print("[Persistent views restore error]", e)
 
-        # Cogs (enregistrent les commandes)
-        self.add_cog(AdminCog(self))
-        self.add_cog(SpeedCog(self))
-        self.add_cog(DiagCog(self))
-
-        # ---------- DIAG ----------
-        print("discord.py version:", discord.__version__)
-        print("Guilds du bot:", [(g.name, g.id) for g in self.guilds])
-
-        g = GUILD_OBJ
-
-        # ---------- HARD RESET GUILD ----------
-        try:
-            print("[CLEAR] purge des commandes GUILD…")
-            self.tree.clear_commands(guild=g)      # vide le cache local des cmds scopées guild
-            await self.tree.sync(guild=g)          # pousse le 'vide' côté Discord
-            print("[CLEAR] OK")
-        except Exception as e:
-            print("[CLEAR ERROR]", e)
-
-        # ---------- PUBLISH PROPRE ----------
-        try:
-            # (optionnel) sync global
-            try:
-                gl = await self.tree.sync()
-                print(f"[SYNC global] {len(gl)} cmds")
-            except Exception as e:
-                print("[SYNC global ERROR]", e)
-
-            # copie → guild et publication immédiate
-            self.tree.copy_global_to(guild=g)
-            gg = await self.tree.sync(guild=g)
-            print(f"[SYNC guild] {len(gg)} cmds")
-
-            fetched = await self.tree.fetch_commands(guild=g)
-            print("[FETCH guild]", [c.name for c in fetched])
-
-            self.synced = True
-        except Exception as e:
-            print("[SYNC guild ERROR]", e)
-            self.synced = False
-
-    # ------------ on_ready (resync de sûreté) ------------
     async def on_ready(self):
-        print(f"✅ Connecté en tant que {self.user} ({self.user.id})")
-        try:
-            gg = await self.tree.sync(guild=GUILD_OBJ)
-            print(f"[SYNC on_ready] {len(gg)} cmds")
-            fetched = await self.tree.fetch_commands(guild=GUILD_OBJ)
-            print("[FETCH on_ready guild]", [c.name for c in fetched])
-            self.synced = True
-        except Exception as e:
-            print("[SYNC on_ready ERROR]", e)
-
-        # Panneau d'accueil
-        if CH_WELCOME:
-            ch=self.get_channel(CH_WELCOME)
-            if isinstance(ch, discord.TextChannel):
-                try:
-                    await ch.send(
-                        embed=discord.Embed(
-                            title="**Bienvenue dans l’Espace Rencontre de Miri !**",
-                            description=("Crée ton profil et découvre ceux des autres.\n"
-                                         "Likes, matchs, MP privés, speed dating…\n\n"
-                                         "⚠️ Réservé aux **18+**.\n\n"
-                                         "Clique ci-dessous pour commencer :"),
-                            color=discord.Color.purple()
-                        ),
-                        view=StartFormView()
-                    )
-                except Exception: pass
-
-    async def on_guild_available(self, guild: discord.Guild):
-        if GUILD_ID and guild.id==GUILD_ID and not self.synced:
+        # Sync HYBRIDE : guild (immédiat) + global (multi-serveurs)
+        if not self.synced:
             try:
-                cmds_g = await self.tree.sync(guild=GUILD_OBJ)
-                print(f"[SYNC guild_available] {len(cmds_g)} cmds")
-                self.synced=True
+                # 1) copie les commandes globales vers le guild pour effet instant
+                self.tree.copy_global_to(guild=GUILD_OBJ)
+                await self.tree.sync(guild=GUILD_OBJ)
+
+                # 2) sync global (propagation plus lente)
+                await self.tree.sync()
+
+                self.synced = True
+                print(f"[SYNC] Global+Guild OK pour {GUILD_ID}")
             except Exception as e:
-                print("[SYNC guild_available ERROR]", e)
+                print(f"[SYNC] Échec de la sync: {e}")
 
-    async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        try:
-            if interaction.response.is_done(): await interaction.followup.send(f"⚠️ Erreur: {error}", ephemeral=True)
-            else: await interaction.response.send_message(f"⚠️ Erreur: {error}", ephemeral=True)
-        except Exception: pass
+        print(f"Connecté comme {self.user} (id={self.user.id})")
+        activity = discord.Game(name="Miri Rencontre")
+        await self.change_presence(status=discord.Status.online, activity=activity)
 
-    async def on_message(self, message: discord.Message):
-        if message.author.bot: return
-        # NOTE: pas de process_commands ici -> SLASH-ONLY garanti
-        # DM form
-        if isinstance(message.channel, discord.DMChannel):
-            uid=message.author.id
-            if uid in dm_sessions:
-                s=dm_sessions[uid]; step=s["step"]; content=message.content.strip()
-                try:
-                    if step==0:
-                        age=int(content)
-                        if age<18: await message.channel.send("❌ Réservé aux 18 ans et plus. Donne un âge valide (≥18)."); return
-                        s["answers"]["age"]=age; s["step"]=1; await message.channel.send("2/5 — Ton **genre** ? (Fille / Homme)"); return
-                    if step==1:
-                        s["answers"]["genre"]=content; s["step"]=2; await message.channel.send("3/5 — Ton **attirance** ? (ex: Hétéro, Bi…) *(ou `skip`)*"); return
-                    if step==2:
-                        s["answers"]["orientation"]="" if content.lower()=="skip" else content; s["step"]=3; await message.channel.send("4/5 — Tes **passions** ? *(ou `skip`)*"); return
-                    if step==3:
-                        s["answers"]["passions"]="" if content.lower()=="skip" else content; s["step"]=4; await message.channel.send("5/5 — Ton **activité** ? *(ou `skip`)*"); return
-                    if step==4:
-                        s["answers"]["activite"]="" if content.lower()=="skip" else content
-                        is_edit=s["is_edit"]; answers=s["answers"]; dm_sessions.pop(uid,None)
-                        old=storage.get_profile(uid) or {}; photo_keep=old.get("photo_url","")
-                        profile={"age":answers["age"],"genre":answers["genre"],"orientation":answers.get("orientation",""),
-                                 "passions":answers.get("passions",""),"activite":answers.get("activite",""),
-                                 "photo_url":(photo_keep if is_edit else ""), "updated_at": datetime.now(TZ).isoformat()}
-                        awaiting_photo[uid]={"profile":profile,"is_edit":is_edit}
-                        await message.channel.send("✅ Formulaire reçu ! Maintenant, **envoie une photo** (upload ou lien). Tu peux répondre `skip`.")
-                        return
-                except ValueError:
-                    await message.channel.send("⚠️ Donne un **nombre** pour l’âge (ex: 22)."); return
-            if uid in awaiting_photo:
-                photo_url=None
-                if message.attachments:
-                    att=message.attachments[0]
-                    if (att.content_type and att.content_type.startswith("image")) or att.filename.lower().endswith((".png",".jpg",".jpeg",".webp",".gif")):
-                        photo_url=att.url
-                if not photo_url:
-                    m=re.search(r'https?://\S+', message.content)
-                    if m: photo_url=m.group(0)
-                if message.content.strip().lower() in {"skip","aucune","non","ignore"}: photo_url=""
-                payload=awaiting_photo.pop(uid); prof=payload["profile"]; is_edit=payload.get("is_edit",False)
-                if photo_url is not None: prof["photo_url"]=photo_url
-                guild=discord.utils.get(self.guilds, id=GUILD_ID)
-                if not guild: await message.channel.send("⚠️ Je ne trouve pas le serveur. Réessaie plus tard."); return
-                member=guild.get_member(uid)
-                if not member: await message.channel.send("⚠️ Je ne te trouve pas sur le serveur."); return
-                storage.set_profile(uid, prof); await publish_or_update_profile(guild, member, prof)
-                if not is_edit and ROLE_ACCESS:
-                    role=guild.get_role(ROLE_ACCESS)
-                    if role:
-                        try:
-                            if role not in member.roles: await member.add_roles(role, reason="Création du profil Rencontre")
-                            log_line(guild, f"✅ Rôle vérifié/attribué : {member} ({member.id}) → {role.name}")
-                        except discord.Forbidden: log_line(guild, f"⚠️ Permissions insuffisantes rôle {role.name} → {member} ({member.id})")
-                await message.channel.send("✅ Profil mis à jour." if is_edit else "✅ Profil créé. Bienvenue dans l’Espace Rencontre !")
+# -------------------- LANCEMENT --------------------
+if not DISCORD_TOKEN:
+    raise RuntimeError("DISCORD_TOKEN manquant dans l'env.")
 
-# -------------------- Entrée --------------------
 bot = RencontreBot()
-if __name__ == "__main__":
-    if not DISCORD_TOKEN:
-        raise SystemExit("DISCORD_TOKEN est requis (mets-le en variable d’environnement).")
-    bot.run(DISCORD_TOKEN)
+bot.run(DISCORD_TOKEN)

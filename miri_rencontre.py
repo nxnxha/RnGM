@@ -1,5 +1,5 @@
-# miri_rencontre.py — GUILD-ONLY + SpeedPerms + Welcome Panel (brandé) + Full DM Flow
-import os, re, json, asyncio
+# miri_rencontre.py — GUILD-ONLY + Purge Global + Welcome brandé + Full DM Flow + SpeedPerms + RencontreBan + Auto-clean leave + SpeedDating robuste
+import os, re, json, asyncio, time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List, Tuple
 from zoneinfo import ZoneInfo
@@ -28,10 +28,9 @@ TZ = ZoneInfo("Europe/Paris")
 
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True
+intents.members = True          # nécessaire pour on_member_remove + roles
 intents.message_content = True  # pour DM
 
-# -------------- GUILD OBJ (scopage anti-doublon) --------------
 GUILD_OBJ = discord.Object(id=GUILD_ID)
 
 # -------------------- Storage --------------------
@@ -42,7 +41,9 @@ class Storage:
             "profiles": {}, "profile_msgs": {}, "first_msg_counts": {},
             "likes": {}, "passes": {}, "matches": [],
             "speed_perms": {"roles": [], "users": []},
-            "welcome_panel": None
+            "welcome_panel": None,
+            "banned_users": [],
+            "speed_last_run": 0.0
         }
         self.load()
     def load(self):
@@ -52,6 +53,8 @@ class Storage:
                     d=json.load(f)
                     self.data.update(d)
                     self.data.setdefault("speed_perms", {"roles": [], "users": []})
+                    self.data.setdefault("banned_users", [])
+                    self.data.setdefault("speed_last_run", 0.0)
             except Exception: pass
     def save(self):
         try:
@@ -64,14 +67,18 @@ class Storage:
     def set_profile(self, uid:int, prof:Dict[str,Any]): self.data["profiles"][str(uid)] = prof; self.save()
     def delete_profile_everywhere(self, uid:int):
         self.data["profiles"].pop(str(uid), None)
-        self.data["profile_msgs"].pop(str(uid), None)
         self.data["likes"].pop(str(uid), None)
         self.data["passes"].pop(str(uid), None)
+        # reset anti-spam pair counts
         fmc = self.data.get("first_msg_counts", {})
         for k in list(fmc.keys()):
-            if k.startswith(f"{uid}:") or k.endswith(f":{uid}"):
+            a,b = (k.split(":")+["",""])[:2]
+            if a == str(uid) or b == str(uid):
                 fmc.pop(k, None)
+        # matches purge
         self.data["matches"] = [[a,b] for a,b in self.data["matches"] if int(a)!=uid and int(b)!=uid]
+        # ref message
+        self.data["profile_msgs"].pop(str(uid), None)
         self.save()
     def set_profile_msg(self, uid:int, channel_id:int, message_id:int):
         self.data["profile_msgs"][str(uid)] = {"channel_id":channel_id,"message_id":message_id}; self.save()
@@ -79,10 +86,12 @@ class Storage:
     def inc_first_msg(self, author_id:int, target_id:int)->int:
         key=f"{author_id}:{target_id}"; val=self.data["first_msg_counts"].get(key,0)+1
         self.data["first_msg_counts"][key]=val; self.save(); return val
+
     def like(self, user_id:int, target_id:int)->bool:
         if user_id==target_id: return False
         likes=self.data["likes"].setdefault(str(user_id),[])
-        if target_id not in likes: likes.append(target_id); self.save()
+        if target_id not in likes:
+            likes.append(target_id); self.save()
         other=set(self.data["likes"].get(str(target_id),[]))
         if user_id in other:
             pair=sorted([user_id,target_id])
@@ -109,6 +118,17 @@ class Storage:
         u=self.data["speed_perms"].setdefault("users", [])
         if uid in u: u.remove(uid); self.save()
 
+    # bans rencontre
+    def is_banned(self, uid:int)->bool: return int(uid) in set(map(int, self.data.get("banned_users", [])))
+    def ban_user(self, uid:int):
+        b=self.data.setdefault("banned_users", [])
+        if uid not in b: b.append(uid); self.save()
+    def unban_user(self, uid:int):
+        b=self.data.setdefault("banned_users", [])
+        if uid in b: b.remove(uid); self.save()
+    def list_bans(self)->List[int]:
+        return list(map(int, self.data.get("banned_users", [])))
+
 storage = Storage(DATA_FILE)
 
 # -------------------- Utils --------------------
@@ -118,6 +138,7 @@ def log_line(guild: Optional[discord.Guild], text:str):
     ch = guild.get_channel(CH_LOGS)
     if isinstance(ch, discord.TextChannel):
         asyncio.create_task(ch.send(f"{now_ts()} {text}"))
+
 def allowed_to_manage(inter: discord.Interaction, owner_id:int)->bool:
     if inter.user.id==owner_id: return True
     if isinstance(inter.user, discord.Member) and inter.user.guild_permissions.manage_guild: return True
@@ -127,8 +148,13 @@ def _clean(v: Optional[str], fallback: str = "—") -> str:
     v = (v or "").strip()
     return v if v else fallback
 
+def can_run_speed(cooldown_sec=300) -> bool:
+    last = storage.data.get("speed_last_run", 0.0)
+    return (time.time() - float(last)) >= cooldown_sec
+def mark_speed_run():
+    storage.data["speed_last_run"] = time.time(); storage.save()
+
 # -------------------- States --------------------
-awaiting_photo: Dict[int, Dict[str, Any]] = {}
 dm_sessions: Dict[int, Dict[str, Any]] = {}
 
 # -------------------- Embeds --------------------
@@ -171,8 +197,12 @@ def build_profile_embed(member: discord.Member, prof: Dict[str, Any]) -> discord
 # -------------------- Views --------------------
 class StartFormView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
+
     @discord.ui.button(label="✨ Créer mon profil maintenant", style=discord.ButtonStyle.success, custom_id="start_profile_btn")
     async def start_profile_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if storage.is_banned(interaction.user.id):
+            await interaction.response.send_message("🚫 Tu n’es pas autorisé(e) à utiliser l’Espace Rencontre.", ephemeral=True)
+            return
         await interaction.response.send_message("⏳ J’ouvre un DM avec toi…", ephemeral=True)
         ok=True
         try:
@@ -198,6 +228,9 @@ class StartDMFormView(discord.ui.View):
     def __init__(self, is_edit: bool): super().__init__(timeout=None); self.is_edit=is_edit
     @discord.ui.button(label="Démarrer", style=discord.ButtonStyle.primary, custom_id="start_dm_form")
     async def start_dm_form(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if storage.is_banned(interaction.user.id):
+            await interaction.response.send_message("🚫 Accès Rencontre retiré. Contacte un admin si c’est une erreur.", ephemeral=True)
+            return
         await interaction.response.send_message("✅ OK, on fait ça ici en DM. Réponds aux questions ⤵️", ephemeral=True)
         uid=interaction.user.id
         dm_sessions[uid]={"step":0,"is_edit":self.is_edit,"answers":{}}
@@ -255,6 +288,7 @@ class ProfileView(discord.ui.View):
             await dm.send("✏️ On modifie ton profil ici. Clique **Démarrer** :", view=StartDMFormView(is_edit=True))
         except Exception: ok=False
         await interaction.edit_original_response(content=("📩 DM envoyé, ouvre le formulaire." if ok else "⚠️ Impossible d’ouvrir un DM pour l’édition."))
+
     @discord.ui.button(emoji="🗑️", label="Supprimer", style=discord.ButtonStyle.danger, custom_id="pf_delete")
     async def del_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message("⏳ Je supprime ton profil…", ephemeral=True)
@@ -264,7 +298,8 @@ class ProfileView(discord.ui.View):
         if ref:
             ch=interaction.guild.get_channel(ref["channel_id"])
             if isinstance(ch, discord.TextChannel):
-                try: msg=await ch.fetch_message(ref["message_id"]); await msg.delete()
+                try:
+                    msg=await ch.fetch_message(ref["message_id"]); await msg.delete()
                 except Exception: pass
         member=interaction.guild.get_member(self.owner_id)
         log_line(interaction.guild, f"🗑️ Suppression : {member} ({member.id})")
@@ -281,31 +316,31 @@ async def publish_or_update_profile(guild: discord.Guild, member: discord.Member
     if ref:
         ch=guild.get_channel(ref["channel_id"])
         if isinstance(ch, discord.TextChannel):
-            try: msg=await ch.fetch_message(ref["message_id"]); await msg.edit(embed=embed, view=view, content=None); return
+            try:
+                msg=await ch.fetch_message(ref["message_id"])
+                await msg.edit(embed=embed, view=view, content=None); return
             except Exception: pass
     ch=target_channel_for(guild, prof)
     if not isinstance(ch, discord.TextChannel): return
-    msg=await ch.send(embed=embed, view=view); storage.set_profile_msg(member.id, ch.id, msg.id)
+    msg=await ch.send(embed=embed, view=view)
+    storage.set_profile_msg(member.id, ch.id, msg.id)
 
 # -------------------- Slash COGS --------------------
 class AdminCog(commands.Cog, name="Admin"):
     def __init__(self, bot: commands.Bot): self.bot=bot
 
-    @app_commands.command(name="resetrencontre", description="⚠️ Réinitialise complètement tous les profils Rencontre (admin)")
+    @app_commands.command(name="resetrencontre", description="⚠️ Réinitialise complètement (banlist conservée)")
     @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(administrator=True)
     async def reset_rencontre(self, interaction: discord.Interaction):
         try:
-            if os.path.exists(DATA_FILE): os.remove(DATA_FILE)
+            welcome = storage.data.get("welcome_panel")
+            banned  = storage.list_bans()
             storage.data={"profiles":{},"profile_msgs":{},"first_msg_counts":{},"likes":{},"passes":{},"matches":[],
-                          "speed_perms":{"roles":[],"users":[]}, "welcome_panel": storage.data.get("welcome_panel")}
+                          "speed_perms":{"roles":[],"users":[]}, "welcome_panel": welcome, "banned_users": banned,
+                          "speed_last_run": storage.data.get("speed_last_run", 0.0)}
             storage.save()
-            await interaction.response.send_message(
-                "✅ Données Rencontre **réinitialisées**.\n"
-                "• Supprime manuellement les vieux messages si besoin.\n"
-                "• Les membres utilisent le **bouton** pour (re)créer leur profil.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("✅ Données Rencontre **réinitialisées** (banlist conservée).", ephemeral=True)
             log_line(interaction.guild, f"🗑️ Reset Rencontre (complet) par {interaction.user} ({interaction.user.id})")
         except Exception as e:
             await interaction.response.send_message(f"⚠️ Erreur pendant le reset : {e}", ephemeral=True)
@@ -313,15 +348,23 @@ class AdminCog(commands.Cog, name="Admin"):
     @app_commands.command(name="resetprofil", description="🗑️ Supprime ton propre profil Rencontre")
     @app_commands.guilds(GUILD_OBJ)
     async def reset_profil(self, interaction: discord.Interaction):
-        uid=interaction.user.id; had=storage.get_profile(uid) is not None
+        uid=interaction.user.id
+        had=storage.get_profile(uid) is not None
+        ref=storage.get_profile_msg(uid)
         storage.delete_profile_everywhere(uid)
+        if ref:
+            ch=interaction.guild.get_channel(ref["channel_id"])
+            if isinstance(ch, discord.TextChannel):
+                try:
+                    msg=await ch.fetch_message(ref["message_id"]); await msg.delete()
+                except Exception: pass
         if had:
             await interaction.response.send_message("🗑️ Ton profil a été supprimé. Utilise le **bouton** pour recommencer.", ephemeral=True)
             log_line(interaction.guild, f"🗑️ Profil reset par {interaction.user} ({interaction.user.id})")
         else:
             await interaction.response.send_message("ℹ️ Tu n’avais pas encore de profil enregistré.", ephemeral=True)
 
-    # --------- Speed Dating Permissions (rôles & users) ----------
+    # --------- SpeedPerms ----------
     speed_group = app_commands.Group(name="speedperms", description="Gérer qui peut lancer le speed dating", guild_ids=[GUILD_ID])
 
     @speed_group.command(name="addrole", description="Autoriser un rôle à lancer /speeddating")
@@ -362,6 +405,54 @@ class AdminCog(commands.Cog, name="Admin"):
         u_txt = ", ".join([u.mention for u in users if u]) or "—"
         await interaction.response.send_message(f"**Rôles autorisés :** {r_txt}\n**Membres autorisés :** {u_txt}", ephemeral=True)
 
+    # --------- Rencontre BAN ----------
+    ban_group = app_commands.Group(name="rencontreban", description="Gérer l'accès Rencontre (ban/unban/list)", guild_ids=[GUILD_ID])
+
+    @ban_group.command(name="add", description="Retirer l'accès Rencontre à un membre (supprime profil + rôle)")
+    async def rb_add(self, interaction: discord.Interaction, user: discord.Member, raison: Optional[str] = None):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admin requis.", ephemeral=True); return
+        storage.ban_user(user.id)
+
+        # retirer rôle Accès Rencontre
+        if ROLE_ACCESS:
+            role = interaction.guild.get_role(ROLE_ACCESS)
+            if role and role in user.roles:
+                try: await user.remove_roles(role, reason="Ban Rencontre")
+                except Exception: pass
+
+        # supprimer profil + message
+        ref = storage.get_profile_msg(user.id)
+        storage.delete_profile_everywhere(user.id)
+        if ref:
+            ch=interaction.guild.get_channel(ref["channel_id"])
+            if isinstance(ch, discord.TextChannel):
+                try:
+                    msg=await ch.fetch_message(ref["message_id"]); await msg.delete()
+                except Exception: pass
+
+        await interaction.response.send_message(f"🚫 **{user.display_name}** banni de l’Espace Rencontre.", ephemeral=True)
+        log_line(interaction.guild, f"🚫 RencontreBan ADD : {user} ({user.id}) — {raison or '—'}")
+
+    @ban_group.command(name="remove", description="Rendre l'accès Rencontre à un membre")
+    async def rb_remove(self, interaction: discord.Interaction, user: discord.Member):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admin requis.", ephemeral=True); return
+        storage.unban_user(user.id)
+        await interaction.response.send_message(f"✅ **{user.display_name}** peut à nouveau utiliser l’Espace Rencontre.", ephemeral=True)
+        log_line(interaction.guild, f"✅ RencontreBan REMOVE : {user} ({user.id})")
+
+    @ban_group.command(name="list", description="Voir les membres bannis de l'Espace Rencontre")
+    async def rb_list(self, interaction: discord.Interaction):
+        ids = storage.list_bans()
+        if not ids:
+            await interaction.response.send_message("Aucun membre banni.", ephemeral=True); return
+        names = []
+        for i in ids:
+            m = interaction.guild.get_member(i)
+            names.append(m.mention if m else f"`{i}`")
+        await interaction.response.send_message("**Bannis Rencontre :** " + ", ".join(names), ephemeral=True)
+
     @app_commands.command(name="ping", description="Test de présence des commandes")
     @app_commands.guilds(GUILD_OBJ)
     async def ping(self, interaction: discord.Interaction):
@@ -384,28 +475,51 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
         if not ok:
             await interaction.response.send_message("❌ Tu n’es pas autorisé(e) à lancer le speed dating.", ephemeral=True); return
 
+        # Cooldown anti-spam (5 min)
+        if not can_run_speed(300):
+            await interaction.response.send_message("⏳ Patiente un peu avant de relancer un speed dating.", ephemeral=True)
+            return
+
         if not CH_SPEED:
             await interaction.response.send_message("❌ CH_SPEED non défini.", ephemeral=True); return
         speed_ch=interaction.guild.get_channel(CH_SPEED)
         if not isinstance(speed_ch, discord.TextChannel):
             await interaction.response.send_message("❌ Salon speed introuvable.", ephemeral=True); return
 
+        # participants actifs (1h)
         cutoff=datetime.now(timezone.utc)-timedelta(hours=1)
         authors:List[int]=[]
         try:
             async for msg in speed_ch.history(limit=500, oldest_first=False, after=cutoff):
                 if msg.author.bot: continue
-                if msg.author.id not in authors: authors.append(msg.author.id)
+                uid = msg.author.id
+                if uid not in authors: authors.append(uid)
         except Exception: pass
 
-        if len(authors)<2:
-            await interaction.response.send_message("Pas assez de personnes actives dans l’heure.", ephemeral=True); return
+        # Filtre éligibles : non banni + ROLE_ACCESS si défini
+        eligible: List[int] = []
+        for uid in authors:
+            if storage.is_banned(uid): continue
+            member = interaction.guild.get_member(uid)
+            if not member: continue
+            if ROLE_ACCESS:
+                role = interaction.guild.get_role(ROLE_ACCESS)
+                if role and role not in member.roles: continue
+            eligible.append(uid)
 
-        import random; random.shuffle(authors)
-        pairs:List[Tuple[int,int]]=[]
-        while len(authors)>=2 and len(pairs)<couples:
-            a=authors.pop(); b=authors.pop()
-            if a!=b: pairs.append((a,b))
+        if len(eligible) < 2:
+            await interaction.response.send_message("Pas assez de personnes **éligibles et actives** dans l’heure.", ephemeral=True)
+            return
+
+        import random
+        random.shuffle(eligible)
+        max_pairs = min(max(1, couples), len(eligible)//2)
+        pairs: List[Tuple[int,int]] = []
+        while len(pairs) < max_pairs and len(eligible) >= 2:
+            a = eligible.pop()
+            b = eligible.pop()
+            if a != b:
+                pairs.append((a,b))
 
         created=[]
         for a,b in pairs:
@@ -413,13 +527,22 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
             if not ma or not mb: continue
             name=f"Speed ⏳ {ma.display_name} × {mb.display_name}"
             try:
-                th=await speed_ch.create_thread(name=name, type=discord.ChannelType.private_thread, invitable=False)
+                th=await speed_ch.create_thread(
+                    name=name,
+                    type=discord.ChannelType.private_thread,
+                    invitable=False,
+                    auto_archive_duration=60  # archive auto
+                )
                 await th.add_user(ma); await th.add_user(mb)
-                await th.send(f"Bienvenue {ma.mention} et {mb.mention} — vous avez **5 minutes** ⏳. Soyez respectueux/sses.")
+                await th.send(f"Bienvenue {ma.mention} et {mb.mention} — vous avez **5 minutes** ⏳. "
+                              f"Soyez respectueux/sses. Le fil sera verrouillé à la fin.")
                 created.append(th)
-            except Exception: continue
+            except Exception:
+                continue
 
+        mark_speed_run()
         await interaction.response.send_message(f"✅ Créé {len(created)} threads éphémères.", ephemeral=True)
+
         await asyncio.sleep(5*60)
         for t in created:
             try: await t.edit(archived=True, locked=True)
@@ -427,15 +550,28 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
 
 class DiagCog(commands.Cog, name="Diag"):
     def __init__(self, bot: commands.Bot): self.bot=bot
+
     @app_commands.command(name="sync", description="Resynchronise les commandes (admin)")
     @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(administrator=True)
     async def sync_cmds(self, interaction: discord.Interaction):
         try:
-            cmds = await interaction.client.tree.sync(guild=GUILD_OBJ)  # guild-only, pas de doublon
-            await interaction.response.send_message(f"🔁 Sync OK — {len(cmds)} commandes.", ephemeral=True)
+            cmds = await interaction.client.tree.sync(guild=GUILD_OBJ)
+            await interaction.response.send_message(f"🔁 Sync OK — {len(cmds)} commandes (guild).", ephemeral=True)
         except Exception as e:
             await interaction.response.send_message(f"⚠️ Sync fail : {e}", ephemeral=True)
+
+    @app_commands.command(name="clearglobals", description="Purger toutes les commandes GLOBAL (admin)")
+    @app_commands.guilds(GUILD_OBJ)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def clear_globals(self, interaction: discord.Interaction):
+        try:
+            t = interaction.client.tree
+            t.clear_commands(guild=None)
+            await t.sync()  # pousse 0 → supprime toutes les globales
+            await interaction.response.send_message("🧹 Global slash **purgées**. Il ne reste que les guild-only.", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"⚠️ Clear globals fail : {e}", ephemeral=True)
 
 # -------------------- Accueil Auto --------------------
 async def ensure_welcome_panel(bot: commands.Bot):
@@ -449,8 +585,7 @@ async def ensure_welcome_panel(bot: commands.Bot):
     if isinstance(ref, dict):
         try:
             msg = await ch.fetch_message(ref.get("message_id", 0))
-            if msg:  # déjà présent
-                return
+            if msg: return
         except Exception:
             pass
 
@@ -483,6 +618,7 @@ class RencontreBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents, help_command=None)
         self.synced=False
+        self.purged_globals=False
 
     async def setup_hook(self):
         await self.add_cog(AdminCog(self))
@@ -493,9 +629,16 @@ class RencontreBot(commands.Bot):
     async def on_ready(self):
         if not self.synced:
             try:
-                await self.tree.sync(guild=GUILD_OBJ)  # GUILD-ONLY → pas de doublons
+                # 1) Purge toutes les commandes GLOBAL une bonne fois
+                if not self.purged_globals:
+                    self.tree.clear_commands(guild=None)
+                    await self.tree.sync()  # publie 0 → supprime global
+                    self.purged_globals = True
+
+                # 2) Sync GUILD-ONLY (source de vérité)
+                await self.tree.sync(guild=GUILD_OBJ)
                 self.synced = True
-                print(f"[SYNC] Guild-only OK pour {GUILD_ID}")
+                print(f"[SYNC] Purge global OK + Guild-only OK pour {GUILD_ID}")
             except Exception as e:
                 print(f"[SYNC] Échec: {e}")
 
@@ -504,9 +647,7 @@ class RencontreBot(commands.Bot):
         await self.change_presence(status=discord.Status.online, activity=discord.Game("Miri Rencontre"))
 
     async def on_message(self, message: discord.Message):
-        # on laisse passer d'éventuelles commandes texte si besoin (même si on est en slash-first)
         await self.process_commands(message)
-
         # DM uniquement
         if message.author.bot or message.guild is not None:
             return
@@ -616,6 +757,19 @@ class RencontreBot(commands.Bot):
             dm_sessions.pop(uid, None)
             await dm_ch.send("✅ **Profil enregistré.** Il a été publié sur le serveur. Tu peux le modifier/supprimer via les boutons sous ton profil.")
             return
+
+    async def on_member_remove(self, member: discord.Member):
+        # Auto-clean : supprime profil + message publié quand un membre quitte
+        uid = member.id
+        ref = storage.get_profile_msg(uid)
+        storage.delete_profile_everywhere(uid)
+        if ref:
+            ch = member.guild.get_channel(ref["channel_id"])
+            if isinstance(ch, discord.TextChannel):
+                try:
+                    msg = await ch.fetch_message(ref["message_id"]); await msg.delete()
+                except Exception: pass
+        log_line(member.guild, f"👋 Leave cleanup : {member} ({uid}) — profil supprimé")
 
 # -------------------- RUN --------------------
 if not DISCORD_TOKEN:

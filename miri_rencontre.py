@@ -1,5 +1,5 @@
-# miri_rencontre.py — GUILD-ONLY + Atomic Storage + Owners + Speed Panel + SpeedDating (durée libre + -1min warn + .txt report)
-# + Profil (création DM) + Reset complet (supprime message + data + retire rôle Accès) + Ban/Unban + Logs + Welcome panel
+# miri_rencontre.py — Rencontre complet + Panneau d'inscription + SpeedDating (durée libre, -1min warn, .txt report)
+# + Owners + Reset rôle Accès + Bouton 🗑️ protégé + Intégration Affiliations API (mariage/amis/famille/fratrie)
 import os, re, json, asyncio, time, tempfile, shutil
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List, Tuple
@@ -8,6 +8,8 @@ from zoneinfo import ZoneInfo
 import discord
 from discord import app_commands
 from discord.ext import commands
+
+import aiohttp  # pour l'API Affiliations
 
 # -------------------- CONFIG --------------------
 def env_int(name: str, default: int) -> int:
@@ -27,6 +29,15 @@ DATA_FILE     = os.getenv("DATA_FILE", "rencontre_data.json")
 BACKUPS_TO_KEEP = env_int("BACKUPS_TO_KEEP", 3)
 BRAND_COLOR   = 0x7C3AED
 TZ = ZoneInfo("Europe/Paris")
+
+# ---- Affiliations API (nouveau bot) ----
+AFF_API_BASE  = os.getenv("AFF_API_BASE", "http://localhost:8000/v1")  # ex: https://aff-bot.example.com/v1
+# Règles de matching (True/False)
+AFF_EXCLUDE_MARRIED   = os.getenv("AFF_EXCLUDE_MARRIED", "true").lower() in ("1","true","yes","y")
+AFF_MARRY_TOGETHER    = os.getenv("AFF_MARRY_TOGETHER", "false").lower() in ("1","true","yes","y")  # si False et EXCLUDE_MARRIED True => ils sont exclus
+AFF_AVOID_FAMILY      = os.getenv("AFF_AVOID_FAMILY", "true").lower() in ("1","true","yes","y")
+AFF_AVOID_SIBLING     = os.getenv("AFF_AVOID_SIBLING", "true").lower() in ("1","true","yes","y")
+AFF_AVOID_FRIENDS     = os.getenv("AFF_AVOID_FRIENDS", "false").lower() in ("1","true","yes","y")
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -75,7 +86,6 @@ class Storage:
                     d=json.load(f)
                     self.data.update(d)
             except Exception:
-                # try last backup
                 for i in range(1, BACKUPS_TO_KEEP+1):
                     p = f"{self.path}.{i}"
                     if os.path.exists(p):
@@ -85,7 +95,6 @@ class Storage:
                                 self.data.update(d); break
                         except Exception:
                             continue
-        # ensure defaults
         self.data.setdefault("speed_perms", {"roles": [], "users": []})
         self.data.setdefault("banned_users", [])
         self.data.setdefault("speed_last_run", 0.0)
@@ -95,13 +104,12 @@ class Storage:
 
     async def save(self):
         async with self._lock:
-            dirpath = os.path.dirname(self.path) or "."
-            tmp_fd, tmp_path = tempfile.mkstemp(prefix="rencontre_", suffix=".json", dir=dirpath)
+            tmp_fd, tmp_path = tempfile.mkstemp(prefix="rencontre_", suffix=".json", dir=os.path.dirname(self.path) or ".")
             try:
                 with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
                     json.dump(self.data, f, ensure_ascii=False, indent=2)
                 self._rotate_backups()
-                os.replace(tmp_path, self.path)  # atomic on same FS
+                os.replace(tmp_path, self.path)
             except Exception:
                 try: os.remove(tmp_path)
                 except Exception: pass
@@ -115,26 +123,21 @@ class Storage:
         self.data["profiles"].pop(str(uid), None)
         self.data["likes"].pop(str(uid), None)
         self.data["passes"].pop(str(uid), None)
-        # reset anti-spam pair counts
         fmc = self.data.get("first_msg_counts", {})
         for k in list(fmc.keys()):
             a,b = (k.split(":")+["",""])[:2]
             if a == str(uid) or b == str(uid):
                 fmc.pop(k, None)
-        # matches purge
         self.data["matches"] = [[a,b] for a,b in self.data["matches"] if int(a)!=uid and int(b)!=uid]
-        # ref message
         self.data["profile_msgs"].pop(str(uid), None)
         await self.save()
 
     def set_profile_msg(self, uid:int, channel_id:int, message_id:int):
         self.data["profile_msgs"][str(uid)] = {"channel_id":channel_id,"message_id":message_id}
-        # sync save is ok here
         try:
             with open(self.path,"w",encoding="utf-8") as f:
                 json.dump(self.data,f,ensure_ascii=False,indent=2)
-        except Exception:
-            pass
+        except Exception: pass
     def get_profile_msg(self, uid:int)->Optional[Dict[str,int]]: return self.data["profile_msgs"].get(str(uid))
     def inc_first_msg(self, author_id:int, target_id:int)->int:
         key=f"{author_id}:{target_id}"; val=self.data["first_msg_counts"].get(key,0)+1
@@ -145,7 +148,7 @@ class Storage:
         except Exception: pass
         return val
 
-    # --- speed perms (rôles/users autorisés à lancer)
+    # --- speed perms
     def get_speed_roles(self)->List[int]: return list(map(int, self.data["speed_perms"].get("roles", [])))
     def get_speed_users(self)->List[int]: return list(map(int, self.data["speed_perms"].get("users", [])))
     async def add_speed_role(self, rid:int):
@@ -249,32 +252,24 @@ def can_run_speed(cooldown_sec=300) -> bool:
     return (time.time() - float(last)) >= cooldown_sec
 def mark_speed_run():
     storage.data["speed_last_run"] = time.time()
-    # quick sync save
     try:
         with open(DATA_FILE,"w",encoding="utf-8") as f:
             json.dump(storage.data,f,ensure_ascii=False,indent=2)
     except Exception: pass
 
 def parse_duration_to_seconds(duree_str: str) -> int:
-    """
-    Accepte : "10m", "1h", "1h30", "90" (minutes par défaut), "2h0", "45min".
-    Retourne total_seconds >= 60 (sinon force 60).
-    """
     s = (duree_str or "").strip().lower().replace(" ", "")
     if not s:
         return 5 * 60
     if re.fullmatch(r"\d+", s):
-        minutes = int(s)
-        return max(60, minutes * 60)
+        minutes = int(s); return max(60, minutes * 60)
     m = re.fullmatch(r"(\d+)h(\d+)?m?$", s)
     if m:
-        h = int(m.group(1))
-        mn = int(m.group(2) or 0)
+        h = int(m.group(1)); mn = int(m.group(2) or 0)
         return max(60, h * 3600 + mn * 60)
     m2 = re.fullmatch(r"(\d+)m(in)?$", s)
     if m2:
-        minutes = int(m2.group(1))
-        return max(60, minutes * 60)
+        minutes = int(m2.group(1)); return max(60, minutes * 60)
     try:
         return max(60, int(s) * 60)
     except Exception:
@@ -307,6 +302,25 @@ async def full_profile_reset(guild: discord.Guild, user_id: int, log_reason: str
     who = f"{member} ({member.id})" if member else f"{user_id}"
     log_line(guild, f"🧹 {log_reason} : {who} — profil supprimé + rôle retiré")
 
+# ---- Affiliations API helpers ----
+async def fetch_aff_wallets(guild_id: int, user_id: int) -> List[Dict[str, Any]]:
+    """Retourne une liste de dict {rel_id, wallet_id, type} pour l'user (wallets liés).
+       Remarque: si ton bot Affiliations retourne aussi les relations SANS wallet,
+       adapte l’endpoint ou ajoute un paramètre côté API."""
+    base = (AFF_API_BASE or "").rstrip("/")
+    if not base:
+        return []
+    url = f"{base}/affiliations/{guild_id}/{user_id}"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=8) as r:
+                if r.status != 200:
+                    return []
+                data = await r.json()
+                return list(data.get("wallets", []))
+    except Exception:
+        return []
+
 # -------------------- States --------------------
 dm_sessions: Dict[int, Dict[str, Any]] = {}
 
@@ -336,13 +350,11 @@ def build_profile_embed(member: discord.Member, prof: Dict[str, Any]) -> discord
     e.set_author(name=str(member), icon_url=member.display_avatar.url)
     if _clean(prof.get("photo_url"), ""):
         e.set_thumbnail(url=prof["photo_url"])
-
     e.add_field(name="Âge",        value=str(prof.get("age", "—")), inline=True)
     e.add_field(name="Genre",      value=_clean(prof.get("genre")), inline=True)
     e.add_field(name="Attirance",  value=_clean(prof.get("orientation")), inline=True)
     e.add_field(name="Passions",   value=_clean(prof.get("passions")), inline=False)
     e.add_field(name="Activité",   value=_clean(prof.get("activite")), inline=False)
-
     e.set_footer(text="Miri • Rencontre")
     e.timestamp = datetime.now(timezone.utc)
     return e
@@ -465,7 +477,7 @@ class ProfileView(discord.ui.View):
                 except Exception: await inter.response.send_message("⚠️ Impossible d’envoyer le DM (DM fermés ?).", ephemeral=True); log_line(guild, f"⚠️ Contact raté (DM fermés) : {author} ({author.id}) → {target} ({target.id})")
         await interaction.response.send_modal(ContactModal(target_id=self.owner_id))
 
-    # Bouton poubelle — emoji seul. Autorisations vérifiées au clic.
+    # Bouton poubelle — emoji seul. Autorisation au clic.
     @discord.ui.button(emoji="🗑️", label="", style=discord.ButtonStyle.danger, custom_id="pf_delete")
     async def del_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not allowed_to_manage(interaction, self.owner_id):
@@ -572,7 +584,6 @@ class SpeedPanelCog(commands.Cog, name="SpeedPanel"):
         except Exception as e:
             await interaction.response.send_message(f"⚠️ Échec publication : {e}", ephemeral=True)
 
-    # Gestion des inscrits
     group = app_commands.Group(name="speedsignups", description="Gérer les inscriptions Speed Dating", guild_ids=[GUILD_ID])
 
     @group.command(name="list", description="Voir les inscrits actuels")
@@ -596,7 +607,7 @@ class SpeedPanelCog(commands.Cog, name="SpeedPanel"):
 class AdminCog(commands.Cog, name="Admin"):
     def __init__(self, bot: commands.Bot): self.bot=bot
 
-    @app_commands.command(name="resetrencontre", description="⚠️ Réinitialise complètement (banlist conservée)")
+    @app_commands.command(name="resetrencontre", description="⚠️ Réinitialise complètement (banlist/owners conservés)")
     @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(administrator=True)
     async def reset_rencontre(self, interaction: discord.Interaction):
@@ -692,7 +703,7 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
 
     @app_commands.command(
         name="speeddating",
-        description="Crée des threads privés (inscription via bouton) — durée ex: 20m, 25m, 1h30, 90"
+        description="Crée des threads privés (inscriptions par bouton) — durée ex: 20m, 25m, 30m, 1h30"
     )
     @app_commands.guilds(GUILD_OBJ)
     @app_commands.describe(
@@ -722,7 +733,7 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
         if not isinstance(speed_ch, discord.TextChannel):
             await interaction.response.send_message("❌ Salon speed introuvable.", ephemeral=True); return
 
-        # Panneau d'inscription si demandé ou manquant
+        # Panneau si demandé/manquant
         need_publish = autopanel or (storage.get_speed_panel() is None)
         if need_publish:
             try:
@@ -731,7 +742,7 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
             except Exception:
                 pass
 
-        # Récupérer les inscrits éligibles
+        # Inscriptions éligibles
         all_ids = storage.get_signups()
         eligible: List[int] = []
         for uid in all_ids:
@@ -755,7 +766,50 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
             await interaction.response.send_message(txt, ephemeral=True)
             return
 
-        # On vide la liste d’inscrits pour repartir propre
+        # ---- Affiliations: map user -> relations (wallets connus)
+        aff_map: Dict[int, List[Dict[str, Any]]] = {}
+        try:
+            # on parallélise les fetch
+            results = await asyncio.gather(*[fetch_aff_wallets(interaction.guild.id, uid) for uid in eligible], return_exceptions=True)
+            for i, uid in enumerate(eligible):
+                aff_map[uid] = results[i] if isinstance(results[i], list) else []
+        except Exception:
+            aff_map = {uid: [] for uid in eligible}
+
+        def has_link(u:int, v:int, types:set[str]) -> bool:
+            left  = [(w.get("rel_id"), w.get("type")) for w in aff_map.get(u, [])]
+            right = [(w.get("rel_id"), w.get("type")) for w in aff_map.get(v, [])]
+            left_ids  = {rid for rid, t in left if t in types and rid}
+            right_ids = {rid for rid, t in right if t in types and rid}
+            return bool(left_ids & right_ids)
+
+        avoid_types = set()
+        if AFF_AVOID_FAMILY:  avoid_types.add("family")
+        if AFF_AVOID_SIBLING: avoid_types.add("sibling")
+        if AFF_AVOID_FRIENDS: avoid_types.add("friend")
+
+        # Traiter les mariés : exclusion OU groupage
+        singles: List[int] = []
+        married_pairs: List[Tuple[int,int]] = []
+        used = set()
+        for u in eligible:
+            if u in used: continue
+            # cherche conjoint
+            spouse = next((v for v in eligible if v!=u and has_link(u, v, {"marriage"})), None)
+            if spouse:
+                if AFF_EXCLUDE_MARRIED and not AFF_MARRY_TOGETHER:
+                    used.add(u); used.add(spouse)
+                    continue  # on exclut les deux
+                elif AFF_MARRY_TOGETHER:
+                    married_pairs.append((u, spouse))
+                    used.add(u); used.add(spouse)
+                else:
+                    # ni exclusion ni groupage => ils restent disponibles
+                    pass
+            if u not in used:
+                singles.append(u)
+
+        # Réinitialiser la liste d’inscrits (propre)
         await storage.clear_signups()
         await _update_speed_panel_message(interaction.guild)
 
@@ -768,15 +822,33 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
         elif h:      nice_duration = f"{h}h"
         else:        nice_duration = f"{mn}min"
 
-        # Paires
+        # Paires en évitant family/sibling(/friend si activé)
         import random
-        random.shuffle(eligible)
-        max_pairs = min(max(1, couples), len(eligible)//2)
+        random.shuffle(singles)
         pairs: List[Tuple[int,int]] = []
-        while len(pairs) < max_pairs and len(eligible) >= 2:
-            a = eligible.pop()
-            b = eligible.pop()
-            if a != b:
+
+        def pick_partner(a: int, pool: List[int]) -> Optional[int]:
+            # idéal: personne sans lien évité
+            for i, v in enumerate(pool):
+                if not has_link(a, v, avoid_types):
+                    return i
+            return None
+
+        while len(pairs) < couples and len(singles) >= 2:
+            a = singles.pop()
+            idx = pick_partner(a, singles)
+            if idx is None:
+                # pas mieux possible, on prend le prochain
+                b = singles.pop()
+            else:
+                b = singles.pop(idx)
+            pairs.append((a,b))
+
+        # Ajouter des couples mariés si on veut les mettre ensemble, dans la limite couples
+        if AFF_MARRY_TOGETHER and married_pairs and len(pairs) < couples:
+            random.shuffle(married_pairs)
+            for a,b in married_pairs:
+                if len(pairs) >= couples: break
                 pairs.append((a,b))
 
         created_threads: List[discord.Thread] = []
@@ -998,7 +1070,7 @@ class RencontreBot(commands.Bot):
             elif g.startswith("h"):
                 sess["answers"]["genre"] = "Homme"
             else:
-                await dm_ch.send("⚠️ Réponds par **Fille** ou **Homme**.")
+                await dm_ch.send("⚠️ Réponds par **Femme** ou **Homme**.")
                 return
             sess["step"] = 2
             await _send_next_step(dm_ch, uid)

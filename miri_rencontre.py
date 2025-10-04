@@ -1,5 +1,7 @@
-# miri_rencontre.py — Rencontre complet + Panneau d'inscription + SpeedDating (durée libre, -1min warn, .txt report)
-# + Owners + Reset rôle Accès + Bouton 🗑️ protégé + Intégration Affiliations API (mariage/amis/famille/fratrie)
+# miri_rencontre.py — Rencontre complet (dark & passionnel) + Panneau d'inscription
+# + SpeedDating (duos) + SpeedGroup (groupes flexibles, -1min warn, .txt report)
+# + Owners (utilisateur & rôle) + Reset rôle Accès + Logs en embed discrets
+# + Anti-spam leaves + /rencontre_help + /rencontre_stats
 import os, re, json, asyncio, time, tempfile, shutil
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List, Tuple
@@ -8,8 +10,6 @@ from zoneinfo import ZoneInfo
 import discord
 from discord import app_commands
 from discord.ext import commands
-
-import aiohttp  # pour l'API Affiliations
 
 # -------------------- CONFIG --------------------
 def env_int(name: str, default: int) -> int:
@@ -29,15 +29,6 @@ DATA_FILE     = os.getenv("DATA_FILE", "rencontre_data.json")
 BACKUPS_TO_KEEP = env_int("BACKUPS_TO_KEEP", 3)
 BRAND_COLOR   = 0x7C3AED
 TZ = ZoneInfo("Europe/Paris")
-
-# ---- Affiliations API (nouveau bot) ----
-AFF_API_BASE  = os.getenv("AFF_API_BASE", "http://localhost:8000/v1")  # ex: https://aff-bot.example.com/v1
-# Règles de matching (True/False)
-AFF_EXCLUDE_MARRIED   = os.getenv("AFF_EXCLUDE_MARRIED", "true").lower() in ("1","true","yes","y")
-AFF_MARRY_TOGETHER    = os.getenv("AFF_MARRY_TOGETHER", "false").lower() in ("1","true","yes","y")  # si False et EXCLUDE_MARRIED True => ils sont exclus
-AFF_AVOID_FAMILY      = os.getenv("AFF_AVOID_FAMILY", "true").lower() in ("1","true","yes","y")
-AFF_AVOID_SIBLING     = os.getenv("AFF_AVOID_SIBLING", "true").lower() in ("1","true","yes","y")
-AFF_AVOID_FRIENDS     = os.getenv("AFF_AVOID_FRIENDS", "false").lower() in ("1","true","yes","y")
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -60,7 +51,9 @@ class Storage:
             "speed_last_run": 0.0,
             "speed_signups": [],
             "speed_panel": None,
-            "owners": [],
+            "owners": [],              # owners par utilisateur
+            "owner_roles": [],         # owners par rôle
+            "_schema": 2,
         }
         self.load()
 
@@ -95,12 +88,15 @@ class Storage:
                                 self.data.update(d); break
                         except Exception:
                             continue
+        # défauts
         self.data.setdefault("speed_perms", {"roles": [], "users": []})
         self.data.setdefault("banned_users", [])
         self.data.setdefault("speed_last_run", 0.0)
         self.data.setdefault("speed_signups", [])
         self.data.setdefault("speed_panel", None)
         self.data.setdefault("owners", [])
+        self.data.setdefault("owner_roles", [])
+        self.data.setdefault("_schema", 2)
 
     async def save(self):
         async with self._lock:
@@ -117,7 +113,18 @@ class Storage:
     # --- profils
     def get_profile(self, uid:int)->Optional[Dict[str,Any]]: return self.data["profiles"].get(str(uid))
     async def set_profile(self, uid:int, prof:Dict[str,Any]):
-        self.data["profiles"][str(uid)] = prof; await self.save()
+        # timestamps discrets pour stats
+        now_iso = datetime.now(TZ).isoformat(timespec="seconds")
+        existing = self.data["profiles"].get(str(uid))
+        if existing and isinstance(existing, dict):
+            created = existing.get("created_at")
+            prof["created_at"] = created or now_iso
+        else:
+            prof["created_at"] = now_iso
+        prof["updated_at"] = now_iso
+
+        self.data["profiles"][str(uid)] = prof
+        await self.save()
 
     async def delete_profile_everywhere(self, uid:int):
         self.data["profiles"].pop(str(uid), None)
@@ -204,7 +211,7 @@ class Storage:
             return {"channel_id": int(ref["channel_id"]), "message_id": int(ref["message_id"])}
         return None
 
-    # --- owners du bot
+    # --- owners du bot (utilisateurs & rôles)
     def get_owners(self) -> List[int]:
         return list(map(int, self.data.get("owners", [])))
     def is_owner(self, uid: int) -> bool:
@@ -218,27 +225,70 @@ class Storage:
         if uid in o:
             o.remove(uid); await self.save()
 
+    def get_owner_roles(self) -> List[int]:
+        return list(map(int, self.data.get("owner_roles", [])))
+    async def add_owner_role(self, rid: int):
+        r = self.data.setdefault("owner_roles", [])
+        if rid not in r:
+            r.append(rid); await self.save()
+    async def remove_owner_role(self, rid: int):
+        r = self.data.setdefault("owner_roles", [])
+        if rid in r:
+            r.remove(rid); await self.save()
+
 storage = Storage(DATA_FILE)
 
 # -------------------- Utils --------------------
 def now_ts()->str: return datetime.now(TZ).strftime("[%d/%m/%Y %H:%M]")
 
-def log_line(guild: Optional[discord.Guild], text:str):
-    if not guild or not CH_LOGS: return
+# ---------- Logs Embed (propres & discrets) ----------
+def _log_color(level: str) -> int:
+    return {"INFO": 0x3B82F6, "WARN": 0xF59E0B, "ERROR": 0xEF4444}.get(level, BRAND_COLOR)
+
+async def send_log_embed(
+    guild: Optional[discord.Guild],
+    title: str,
+    fields: Dict[str, Any],
+    level: str = "INFO"
+):
+    if not guild or not CH_LOGS:
+        return
     ch = guild.get_channel(CH_LOGS)
-    if isinstance(ch, discord.TextChannel):
-        asyncio.create_task(ch.send(f"{now_ts()} {text}"))
+    if not isinstance(ch, discord.TextChannel):
+        return
+    e = discord.Embed(title=title, color=_log_color(level))
+    for k, v in fields.items():
+        e.add_field(name=k, value=str(v) if v is not None else "—", inline=False)
+    e.set_footer(text=f"Miri • {datetime.now(TZ).strftime('%d/%m/%Y %H:%M')}")
+    await ch.send(embed=e)
+
+async def send_log_profile_event(guild: discord.Guild, action: str, user_id: int, ref: Optional[Dict[str,int]] = None):
+    # n’affiche PAS les champs du profil (privés)
+    fields = {
+        "Utilisateur": f"`{user_id}`",
+        "Action": action,
+        "Date": datetime.now(TZ).strftime("%d/%m/%Y %H:%M"),
+    }
+    if ref and "channel_id" in ref and "message_id" in ref:
+        url = f"https://discord.com/channels/{guild.id}/{ref['channel_id']}/{ref['message_id']}"
+        fields["Profil"] = f"[Voir le message]({url})"
+    await send_log_embed(guild, "👤 Profil — évènement", fields, level="INFO")
 
 def allowed_to_manage(inter: discord.Interaction, owner_id:int)->bool:
     u = inter.user
     if u.id==owner_id: return True
-    if isinstance(u, discord.Member) and u.guild_permissions.administrator: return True
-    if storage.is_owner(u.id): return True
+    if isinstance(u, discord.Member):
+        if u.guild_permissions.administrator or u.guild_permissions.manage_guild: return True
+        if storage.is_owner(u.id): return True
+        owner_roles = set(storage.get_owner_roles())
+        if any(r.id in owner_roles for r in getattr(u, "roles", [])): return True
     return False
 
 def is_operator(m: discord.Member) -> bool:
     if m.guild_permissions.administrator or m.guild_permissions.manage_channels: return True
     if storage.is_owner(m.id): return True
+    owner_roles = set(storage.get_owner_roles())
+    if any(r.id in owner_roles for r in m.roles): return True
     if any(r.id in storage.get_speed_roles() for r in m.roles): return True
     if m.id in storage.get_speed_users(): return True
     return False
@@ -275,6 +325,9 @@ def parse_duration_to_seconds(duree_str: str) -> int:
     except Exception:
         return 5 * 60
 
+def _safe_name(s: str) -> str:
+    return re.sub(r'[\u200B-\u200D\uFEFF\r\n]+', '', s)[:95]
+
 # ---------- Reset profil complet (data + message + rôle) ----------
 async def _remove_access_role(guild: discord.Guild, member: Optional[discord.Member]):
     if not (guild and member and ROLE_ACCESS):
@@ -286,7 +339,7 @@ async def _remove_access_role(guild: discord.Guild, member: Optional[discord.Mem
         except Exception:
             pass
 
-async def full_profile_reset(guild: discord.Guild, user_id: int, log_reason: str = "Reset profil"):
+async def full_profile_reset(guild: discord.Guild, user_id: int, log_reason: Optional[str] = "Reset profil"):
     ref = storage.get_profile_msg(user_id)
     await storage.delete_profile_everywhere(user_id)
     if ref:
@@ -299,27 +352,8 @@ async def full_profile_reset(guild: discord.Guild, user_id: int, log_reason: str
                 pass
     member = guild.get_member(user_id)
     await _remove_access_role(guild, member)
-    who = f"{member} ({member.id})" if member else f"{user_id}"
-    log_line(guild, f"🧹 {log_reason} : {who} — profil supprimé + rôle retiré")
-
-# ---- Affiliations API helpers ----
-async def fetch_aff_wallets(guild_id: int, user_id: int) -> List[Dict[str, Any]]:
-    """Retourne une liste de dict {rel_id, wallet_id, type} pour l'user (wallets liés).
-       Remarque: si ton bot Affiliations retourne aussi les relations SANS wallet,
-       adapte l’endpoint ou ajoute un paramètre côté API."""
-    base = (AFF_API_BASE or "").rstrip("/")
-    if not base:
-        return []
-    url = f"{base}/affiliations/{guild_id}/{user_id}"
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=8) as r:
-                if r.status != 200:
-                    return []
-                data = await r.json()
-                return list(data.get("wallets", []))
-    except Exception:
-        return []
+    if log_reason:
+        await send_log_profile_event(guild, "supprimé", user_id, ref)
 
 # -------------------- States --------------------
 dm_sessions: Dict[int, Dict[str, Any]] = {}
@@ -342,20 +376,28 @@ def make_welcome_embed(guild: Optional[discord.Guild]) -> discord.Embed:
     return e
 
 def build_profile_embed(member: discord.Member, prof: Dict[str, Any]) -> discord.Embed:
+    # Thème sombre & passionnel
     e = discord.Embed(
-        title=f"Profil de {member.display_name}",
-        description="Espace Rencontre — Miri",
-        color=BRAND_COLOR
+        title=f"💫 {member.display_name}",
+        description="✨ Un profil à découvrir ✨",
+        color=0x1C1C1C  # noir profond
     )
     e.set_author(name=str(member), icon_url=member.display_avatar.url)
+
+    # Grande photo en avant (style app de dating)
     if _clean(prof.get("photo_url"), ""):
-        e.set_thumbnail(url=prof["photo_url"])
-    e.add_field(name="Âge",        value=str(prof.get("age", "—")), inline=True)
-    e.add_field(name="Genre",      value=_clean(prof.get("genre")), inline=True)
-    e.add_field(name="Attirance",  value=_clean(prof.get("orientation")), inline=True)
-    e.add_field(name="Passions",   value=_clean(prof.get("passions")), inline=False)
-    e.add_field(name="Activité",   value=_clean(prof.get("activite")), inline=False)
-    e.set_footer(text="Miri • Rencontre")
+        e.set_image(url=prof["photo_url"])
+
+    # Infos rapides stylées
+    e.add_field(name="🕰 Âge", value=f"**{prof.get('age', '—')} ans**", inline=True)
+    e.add_field(name="🌹 Genre", value=_clean(prof.get("genre")), inline=True)
+    e.add_field(name="💘 Attirance", value=_clean(prof.get("orientation")), inline=True)
+
+    # Descriptions immersives
+    e.add_field(name="🔥 Passions", value=f"_{_clean(prof.get('passions'))}_", inline=False)
+    e.add_field(name="🌍 Activité", value=f"_{_clean(prof.get('activite'))}_", inline=False)
+
+    e.set_footer(text="Miri Rencontre • Faites battre les cœurs 💜")
     e.timestamp = datetime.now(timezone.utc)
     return e
 
@@ -427,7 +469,7 @@ class StartDMFormView(discord.ui.View):
             return
         await interaction.response.send_message("✅ OK, on fait ça ici en DM. Réponds aux questions ⤵️", ephemeral=True)
         uid=interaction.user.id
-        dm_sessions[uid]={"step":0,"is_edit":self.is_edit,"answers":{}}
+        dm_sessions[uid]={"step":0,"is_edit":self.is_edit,"answers":{},"ts":time.time()}
         await interaction.channel.send("1/5 — Quel est **ton âge** ? (nombre ≥ 18)")
 
 class ProfileView(discord.ui.View):
@@ -440,23 +482,38 @@ class ProfileView(discord.ui.View):
         await interaction.response.send_message("⏳ Je note ton like…", ephemeral=True)
         if interaction.user.id==self.owner_id:
             await interaction.edit_original_response(content="🤨 Tu ne peux pas te liker toi-même."); return
-        is_match = storage.like(interaction.user.id, self.owner_id)
-        log_line(interaction.guild, f"❤️ Like : {interaction.user} ({interaction.user.id}) → {self.owner_id}")
+        # simple enregistrement local (existant minimal)
+        likes = storage.data.setdefault("likes", {})
+        a = str(interaction.user.id); b=str(self.owner_id)
+        likes.setdefault(a, [])
+        if b not in likes[a]: likes[a].append(b)
+        # match ?
+        is_match = b in likes and a in likes[b]
+        await storage.save()
         await interaction.edit_original_response(content="❤️ Like enregistré.")
         if is_match:
-            a = interaction.guild.get_member(interaction.user.id); b = interaction.guild.get_member(self.owner_id)
-            for m1,m2 in [(a,b),(b,a)]:
+            a_m = interaction.guild.get_member(interaction.user.id); b_m = interaction.guild.get_member(self.owner_id)
+            for m1,m2 in [(a_m,b_m),(b_m,a_m)]:
                 try: dm=await m1.create_dm(); await dm.send(f"🔥 **C’est un match !** Tu as liké **{m2.display_name}** et c’est réciproque. Écrivez-vous !")
                 except Exception: pass
-            log_line(interaction.guild, f"🔥 Match : {a} ({a.id}) ❤️ {b} ({b.id})")
+            storage.data.setdefault("matches", []).append([a,b])
+            await storage.save()
+            await send_log_embed(interaction.guild, "🔥 Match", {
+                "A": f"`{a}`",
+                "B": f"`{b}`",
+                "Date": datetime.now(TZ).strftime("%d/%m/%Y %H:%M"),
+            })
 
     @discord.ui.button(emoji="❌", label="Pass", style=discord.ButtonStyle.secondary, custom_id="pf_pass")
     async def pass_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message("⏳ Je note ton pass…", ephemeral=True)
         if interaction.user.id==self.owner_id:
             await interaction.edit_original_response(content="… Pourquoi passer sur toi-même ? 😅"); return
-        storage.pass_(interaction.user.id, self.owner_id)
-        log_line(interaction.guild, f"❌ Pass : {interaction.user} ({interaction.user.id}) → {self.owner_id}")
+        passes = storage.data.setdefault("passes", {})
+        a = str(interaction.user.id); b=str(self.owner_id)
+        passes.setdefault(a, [])
+        if b not in passes[a]: passes[a].append(b)
+        await storage.save()
         await interaction.edit_original_response(content="👌 C’est noté.")
 
     @discord.ui.button(emoji="📩", label="Contacter", style=discord.ButtonStyle.primary, custom_id="pf_contact")
@@ -473,8 +530,8 @@ class ProfileView(discord.ui.View):
                 if count>FIRST_MSG_LIMIT:
                     await inter.response.send_message(f"❌ Tu as déjà envoyé {FIRST_MSG_LIMIT} premier message à cette personne.", ephemeral=True); return
                 txt=f"**{author.display_name}** souhaite te contacter :\n> {self.msg.value}\n\n(Tu peux répondre directement à ce message.)"
-                try: dm=await target.create_dm(); await dm.send(txt); await inter.response.send_message("✅ Message envoyé en DM à la personne.", ephemeral=True); log_line(guild, f"📨 Contact : {author} ({author.id}) → {target} ({target.id})")
-                except Exception: await inter.response.send_message("⚠️ Impossible d’envoyer le DM (DM fermés ?).", ephemeral=True); log_line(guild, f"⚠️ Contact raté (DM fermés) : {author} ({author.id}) → {target} ({target.id})")
+                try: dm=await target.create_dm(); await dm.send(txt); await inter.response.send_message("✅ Message envoyé en DM à la personne.", ephemeral=True); 
+                except Exception: await inter.response.send_message("⚠️ Impossible d’envoyer le DM (DM fermés ?).", ephemeral=True)
         await interaction.response.send_modal(ContactModal(target_id=self.owner_id))
 
     # Bouton poubelle — emoji seul. Autorisation au clic.
@@ -540,35 +597,56 @@ async def publish_or_update_profile(guild: discord.Guild, member: discord.Member
 # -------------------- Slash COGS --------------------
 class OwnersCog(commands.Cog, name="Owners"):
     def __init__(self, bot: commands.Bot): self.bot = bot
-    group = app_commands.Group(name="owners", description="Gérer les propriétaires du bot", guild_ids=[GUILD_ID])
+    group = app_commands.Group(name="owners", description="Gérer les propriétaires (utilisateurs)", guild_ids=[GUILD_ID])
 
-    @group.command(name="add", description="Ajouter un propriétaire du bot (admin)")
+    @group.command(name="add", description="Ajouter un propriétaire (utilisateur)")
     @app_commands.checks.has_permissions(administrator=True)
     async def owners_add(self, interaction: discord.Interaction, user: discord.Member):
         await storage.add_owner(user.id)
         await interaction.response.send_message(f"✅ **{user.display_name}** ajouté comme owner.", ephemeral=True)
 
-    @group.command(name="remove", description="Retirer un propriétaire du bot (admin)")
+    @group.command(name="remove", description="Retirer un propriétaire (utilisateur)")
     @app_commands.checks.has_permissions(administrator=True)
     async def owners_remove(self, interaction: discord.Interaction, user: discord.Member):
         await storage.remove_owner(user.id)
         await interaction.response.send_message(f"🗑️ **{user.display_name}** retiré des owners.", ephemeral=True)
 
-    @group.command(name="list", description="Voir la liste des owners")
+    @group.command(name="list", description="Lister les owners (utilisateurs)")
     async def owners_list(self, interaction: discord.Interaction):
         ids = storage.get_owners()
-        if not ids:
-            await interaction.response.send_message("Aucun owner défini.", ephemeral=True); return
         mentions = []
         for i in ids:
             m = interaction.guild.get_member(i)
             mentions.append(m.mention if m else f"`{i}`")
-        await interaction.response.send_message("**Owners :** " + ", ".join(mentions), ephemeral=True)
+        await interaction.response.send_message("**Owners (utilisateurs)** : " + (", ".join(mentions) if mentions else "—"), ephemeral=True)
+
+    roles_group = app_commands.Group(name="ownerroles", description="Gérer les propriétaires (rôles)", guild_ids=[GUILD_ID])
+
+    @roles_group.command(name="add", description="Autoriser un RÔLE à être owner du bot")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def ownerroles_add(self, interaction: discord.Interaction, role: discord.Role):
+        await storage.add_owner_role(role.id)
+        await interaction.response.send_message(f"✅ Rôle **{role.name}** ajouté comme owner.", ephemeral=True)
+
+    @roles_group.command(name="remove", description="Retirer un RÔLE owner du bot")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def ownerroles_remove(self, interaction: discord.Interaction, role: discord.Role):
+        await storage.remove_owner_role(role.id)
+        await interaction.response.send_message(f"🗑️ Rôle **{role.name}** retiré des owners.", ephemeral=True)
+
+    @roles_group.command(name="list", description="Lister les rôles owners")
+    async def ownerroles_list(self, interaction: discord.Interaction):
+        rids = storage.get_owner_roles()
+        names = []
+        for rid in rids:
+            r = interaction.guild.get_role(rid)
+            names.append(r.mention if r else f"`{rid}`")
+        await interaction.response.send_message("**Owners (rôles)** : " + (", ".join(names) if names else "—"), ephemeral=True)
 
 class SpeedPanelCog(commands.Cog, name="SpeedPanel"):
     def __init__(self, bot: commands.Bot): self.bot = bot
 
-    @app_commands.command(name="speedpanel", description="(Admin) Publie ou reconstruit le panneau d’inscription")
+    @app_commands.command(name="speedpanel", description="Publie ou reconstruit le panneau d’inscription")
     @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(administrator=True)
     async def speedpanel(self, interaction: discord.Interaction):
@@ -615,14 +693,15 @@ class AdminCog(commands.Cog, name="Admin"):
             welcome = storage.data.get("welcome_panel")
             banned  = storage.list_bans()
             owners  = storage.get_owners()
+            owner_roles = storage.get_owner_roles()
             storage.data={"profiles":{},"profile_msgs":{},"first_msg_counts":{},"likes":{},"passes":{},"matches":[],
                           "speed_perms":{"roles":[],"users":[]}, "welcome_panel": welcome, "banned_users": banned,
                           "speed_last_run": storage.data.get("speed_last_run", 0.0),
                           "speed_signups": [], "speed_panel": storage.get_speed_panel(),
-                          "owners": owners}
+                          "owners": owners, "owner_roles": owner_roles, "_schema": 2}
             await storage.save()
             await interaction.response.send_message("✅ Données Rencontre **réinitialisées** (banlist/owners conservés).", ephemeral=True)
-            log_line(interaction.guild, f"🗑️ Reset Rencontre (complet) par {interaction.user} ({interaction.user.id})")
+            await send_log_embed(interaction.guild, "🗑️ Reset Rencontre", {"Par": f"`{interaction.user.id}`"})
         except Exception as e:
             await interaction.response.send_message(f"⚠️ Erreur pendant le reset : {e}", ephemeral=True)
 
@@ -638,7 +717,7 @@ class AdminCog(commands.Cog, name="Admin"):
             await interaction.response.send_message("ℹ️ Aucun profil enregistré. (Si tu avais le rôle, il vient d’être retiré.)", ephemeral=True)
 
     # --------- SpeedPerms ----------
-    speed_group = app_commands.Group(name="speedperms", description="Gérer qui peut lancer le speed dating", guild_ids=[GUILD_ID])
+    speed_group = app_commands.Group(name="speedperms", description="Qui peut lancer le speed dating", guild_ids=[GUILD_ID])
 
     @speed_group.command(name="addrole", description="Autoriser un rôle à lancer /speeddating")
     @app_commands.checks.has_permissions(administrator=True)
@@ -673,14 +752,14 @@ class AdminCog(commands.Cog, name="Admin"):
         await storage.ban_user(user.id)
         await full_profile_reset(interaction.guild, user.id, log_reason="RencontreBan ADD")
         await interaction.response.send_message(f"🚫 **{user.display_name}** banni de l’Espace Rencontre.", ephemeral=True)
-        log_line(interaction.guild, f"🚫 RencontreBan ADD : {user} ({user.id}) — {raison or '—'}")
+        await send_log_embed(interaction.guild, "🚫 RencontreBan ADD", {"User": f"`{user.id}`", "Raison": raison or "—"})
 
     @ban_group.command(name="remove", description="Rendre l'accès Rencontre à un membre")
     @app_commands.checks.has_permissions(administrator=True)
     async def rb_remove(self, interaction: discord.Interaction, user: discord.Member):
         await storage.unban_user(user.id)
         await interaction.response.send_message(f"✅ **{user.display_name}** peut à nouveau utiliser l’Espace Rencontre.", ephemeral=True)
-        log_line(interaction.guild, f"✅ RencontreBan REMOVE : {user} ({user.id})")
+        await send_log_embed(interaction.guild, "✅ RencontreBan REMOVE", {"User": f"`{user.id}`"})
 
     @ban_group.command(name="list", description="Voir les membres bannis de l'Espace Rencontre")
     async def rb_list(self, interaction: discord.Interaction):
@@ -703,11 +782,11 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
 
     @app_commands.command(
         name="speeddating",
-        description="Crée des threads privés (inscriptions par bouton) — durée ex: 20m, 25m, 30m, 1h30"
+        description="Crée des threads privés en couples (2 par thread) — durée ex: 20m, 30m, 1h"
     )
     @app_commands.guilds(GUILD_OBJ)
     @app_commands.describe(
-        couples="Nombre de couples (pairs max)",
+        couples="Nombre de couples (threads)",
         duree="Durée totale (ex: 20m, 25m, 30m, 1h, 1h30, 90)",
         autopanel="Publier/reconstruire le panneau d’inscription avant de lancer"
     )
@@ -715,7 +794,7 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
         self,
         interaction: discord.Interaction,
         couples: int = 5,
-        duree: str = "5m",
+        duree: str = "20m",
         autopanel: bool = False,
     ):
         m: discord.Member = interaction.user
@@ -766,90 +845,14 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
             await interaction.response.send_message(txt, ephemeral=True)
             return
 
-        # ---- Affiliations: map user -> relations (wallets connus)
-        aff_map: Dict[int, List[Dict[str, Any]]] = {}
-        try:
-            # on parallélise les fetch
-            results = await asyncio.gather(*[fetch_aff_wallets(interaction.guild.id, uid) for uid in eligible], return_exceptions=True)
-            for i, uid in enumerate(eligible):
-                aff_map[uid] = results[i] if isinstance(results[i], list) else []
-        except Exception:
-            aff_map = {uid: [] for uid in eligible}
-
-        def has_link(u:int, v:int, types:set[str]) -> bool:
-            left  = [(w.get("rel_id"), w.get("type")) for w in aff_map.get(u, [])]
-            right = [(w.get("rel_id"), w.get("type")) for w in aff_map.get(v, [])]
-            left_ids  = {rid for rid, t in left if t in types and rid}
-            right_ids = {rid for rid, t in right if t in types and rid}
-            return bool(left_ids & right_ids)
-
-        avoid_types = set()
-        if AFF_AVOID_FAMILY:  avoid_types.add("family")
-        if AFF_AVOID_SIBLING: avoid_types.add("sibling")
-        if AFF_AVOID_FRIENDS: avoid_types.add("friend")
-
-        # Traiter les mariés : exclusion OU groupage
-        singles: List[int] = []
-        married_pairs: List[Tuple[int,int]] = []
-        used = set()
-        for u in eligible:
-            if u in used: continue
-            # cherche conjoint
-            spouse = next((v for v in eligible if v!=u and has_link(u, v, {"marriage"})), None)
-            if spouse:
-                if AFF_EXCLUDE_MARRIED and not AFF_MARRY_TOGETHER:
-                    used.add(u); used.add(spouse)
-                    continue  # on exclut les deux
-                elif AFF_MARRY_TOGETHER:
-                    married_pairs.append((u, spouse))
-                    used.add(u); used.add(spouse)
-                else:
-                    # ni exclusion ni groupage => ils restent disponibles
-                    pass
-            if u not in used:
-                singles.append(u)
-
-        # Réinitialiser la liste d’inscrits (propre)
-        await storage.clear_signups()
-        await _update_speed_panel_message(interaction.guild)
-
-        # Durée
-        total_seconds = parse_duration_to_seconds(duree)
-        mins = total_seconds // 60
-        h = mins // 60
-        mn = mins % 60
-        if h and mn: nice_duration = f"{h}h{mn:02d}"
-        elif h:      nice_duration = f"{h}h"
-        else:        nice_duration = f"{mn}min"
-
-        # Paires en évitant family/sibling(/friend si activé)
+        # Shuffle et couples simples
         import random
-        random.shuffle(singles)
+        random.shuffle(eligible)
         pairs: List[Tuple[int,int]] = []
-
-        def pick_partner(a: int, pool: List[int]) -> Optional[int]:
-            # idéal: personne sans lien évité
-            for i, v in enumerate(pool):
-                if not has_link(a, v, avoid_types):
-                    return i
-            return None
-
-        while len(pairs) < couples and len(singles) >= 2:
-            a = singles.pop()
-            idx = pick_partner(a, singles)
-            if idx is None:
-                # pas mieux possible, on prend le prochain
-                b = singles.pop()
-            else:
-                b = singles.pop(idx)
+        while len(pairs) < couples and len(eligible) >= 2:
+            a = eligible.pop()
+            b = eligible.pop()
             pairs.append((a,b))
-
-        # Ajouter des couples mariés si on veut les mettre ensemble, dans la limite couples
-        if AFF_MARRY_TOGETHER and married_pairs and len(pairs) < couples:
-            random.shuffle(married_pairs)
-            for a,b in married_pairs:
-                if len(pairs) >= couples: break
-                pairs.append((a,b))
 
         created_threads: List[discord.Thread] = []
         started_at = datetime.now(TZ)
@@ -859,7 +862,7 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
         for a,b in pairs:
             ma=interaction.guild.get_member(a); mb=interaction.guild.get_member(b)
             if not ma or not mb: continue
-            name=f"Speed ⏳ {ma.display_name} × {mb.display_name}"
+            name=_safe_name(f"Speed ⏳ {ma.display_name} × {mb.display_name}")
             try:
                 th=await speed_ch.create_thread(
                     name=name,
@@ -869,7 +872,7 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
                 )
                 await th.add_user(ma); await th.add_user(mb)
                 await th.send(
-                    f"Bienvenue {ma.mention} et {mb.mention} — vous avez **{nice_duration}** ⏳.\n"
+                    f"Bienvenue {ma.mention} et {mb.mention} — vous avez **{duree}** ⏳.\n"
                     f"Soyez respectueux·ses. Le fil sera **verrouillé** à la fin."
                 )
                 created_threads.append(th)
@@ -878,11 +881,12 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
 
         mark_speed_run()
         await interaction.response.send_message(
-            f"✅ Créé **{len(created_threads)}** threads pour **{nice_duration}**.",
+            f"✅ Créé **{len(created_threads)}** threads pour **{duree}**.",
             ephemeral=True
         )
 
-        # Alerte -1 minute si possible
+        # Minuteur (-1 min si possible)
+        total_seconds = parse_duration_to_seconds(duree)
         if total_seconds >= 120:
             try:
                 await asyncio.sleep(total_seconds - 60)
@@ -906,7 +910,7 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
             f"Lancé par  : {interaction.user} (id={interaction.user.id})",
             f"Début      : {started_at.strftime('%d/%m/%Y %H:%M:%S')}",
             f"Fin        : {closed_at.strftime('%d/%m/%Y %H:%M:%S')}",
-            f"Durée      : {nice_duration}",
+            f"Durée      : {duree}",
             f"Threads    : {len(created_threads)}",
             "",
             "Paires & Threads :"
@@ -927,12 +931,195 @@ class SpeedCog(commands.Cog, name="SpeedDating"):
                     tmp.write(report_txt)
                     tmp_path = tmp.name
                 await log_ch.send(
-                    content=f"{now_ts()} 📄 **Rapport SpeedDating** — {nice_duration} • {len(created_threads)} threads",
+                    content=f"{now_ts()} 📄 **Rapport SpeedDating** — {duree} • {len(created_threads)} threads",
                     file=discord.File(tmp_path, filename=f"speeddating_{session_id}.txt")
                 )
             except Exception:
                 try:
                     await log_ch.send(f"{now_ts()} 📄 **Rapport SpeedDating**\n```\n{report_txt}\n```")
+                except Exception:
+                    pass
+
+class SpeedGroupCog(commands.Cog, name="SpeedGroup"):
+    def __init__(self, bot: commands.Bot): self.bot = bot
+
+    @app_commands.command(
+        name="speedgroup",
+        description="Crée des threads privés par groupes (noms inclus) — idéal jeux & ateliers"
+    )
+    @app_commands.guilds(GUILD_OBJ)
+    @app_commands.describe(
+        groupe_taille="Nombre de personnes par groupe (défaut 2)",
+        duree="Durée totale ex: 20m, 25m, 30m, 1h, 1h30, 90 (minutes)",
+        autopanel="Publier/reconstruire le panneau avant de lancer"
+    )
+    async def speedgroup(
+        self,
+        interaction: discord.Interaction,
+        groupe_taille: int = 2,
+        duree: str = "20m",
+        autopanel: bool = False,
+    ):
+        m: discord.Member = interaction.user
+        if not is_operator(m):
+            await interaction.response.send_message("❌ Tu n’es pas autorisé(e) à lancer.", ephemeral=True)
+            return
+
+        if not can_run_speed(300):
+            await interaction.response.send_message("⏳ Patiente un peu avant de relancer (cooldown).", ephemeral=True)
+            return
+
+        if not CH_SPEED:
+            await interaction.response.send_message("❌ CH_SPEED non défini.", ephemeral=True); return
+        speed_ch = interaction.guild.get_channel(CH_SPEED)
+        if not isinstance(speed_ch, discord.TextChannel):
+            await interaction.response.send_message("❌ Salon speed introuvable.", ephemeral=True); return
+
+        # Panneau si demandé/manquant
+        need_publish = autopanel or (storage.get_speed_panel() is None)
+        if need_publish:
+            try:
+                msg = await speed_ch.send(embed=build_speed_panel_embed(interaction.guild), view=SpeedPanelView())
+                storage.set_speed_panel(speed_ch.id, msg.id)
+            except Exception:
+                pass
+
+        # Récupère inscrits éligibles
+        all_ids = storage.get_signups()
+        eligible: List[int] = []
+        for uid in all_ids:
+            if storage.is_banned(uid):
+                continue
+            member = interaction.guild.get_member(uid)
+            if not member:
+                continue
+            if ROLE_ACCESS:
+                role = interaction.guild.get_role(ROLE_ACCESS)
+                if role and role not in member.roles:
+                    continue
+            eligible.append(uid)
+
+        if len(eligible) < 2:
+            txt = "Pas assez d’inscrits **éligibles**."
+            txt += " Le panneau est publié." if need_publish else ""
+            await interaction.response.send_message(txt, ephemeral=True)
+            return
+
+        # Optionnel : on purge la liste pour un cycle propre
+        await storage.clear_signups()
+        await _update_speed_panel_message(interaction.guild)
+
+        # Durée lisible
+        total_seconds = parse_duration_to_seconds(duree)
+        mins = total_seconds // 60
+        h, mn = mins // 60, mins % 60
+        if groupe_taille < 2: groupe_taille = 2
+
+        import random
+        random.shuffle(eligible)
+        groups = [eligible[i:i+groupe_taille] for i in range(0, len(eligible), groupe_taille)]
+
+        created_threads: List[discord.Thread] = []
+        started_at = datetime.now(TZ)
+        session_id = int(time.time())
+
+        placed = set()
+        for group in groups:
+            group = [u for u in group if u not in placed]
+            if len(group) < 2:
+                continue
+            placed.update(group)
+
+            # Nom de thread avec les noms des participants
+            noms = []
+            mentions = []
+            for uid in group:
+                mem = interaction.guild.get_member(uid)
+                if mem:
+                    noms.append(_safe_name(mem.display_name))
+                    mentions.append(mem.mention)
+            if not noms: continue
+
+            th_name = _safe_name("Speed ⏳ " + " × ".join(noms))
+            try:
+                th = await speed_ch.create_thread(
+                    name=th_name,
+                    type=discord.ChannelType.private_thread,
+                    invitable=False,
+                    auto_archive_duration=60
+                )
+                for uid in group:
+                    mem = interaction.guild.get_member(uid)
+                    if mem:
+                        await th.add_user(mem)
+
+                await th.send(
+                    f"Bienvenue {', '.join(mentions)} — vous avez **{h and f'{h}h' or ''}{mn and (f'{mn}min' if not h else f'{mn:02d}') or (f'{mins}min' if not h else '')}** ⏳.\n"
+                    f"Soyez respectueux·ses. Le fil sera **verrouillé** à la fin."
+                )
+                created_threads.append(th)
+            except Exception:
+                continue
+
+        mark_speed_run()
+        # message staff
+        nice_duration = f"{h}h{mn:02d}" if h and mn else (f"{h}h" if h else f"{mins}min")
+        await interaction.response.send_message(
+            f"✅ Créé **{len(created_threads)}** thread(s) • durée **{nice_duration}**.",
+            ephemeral=True
+        )
+
+        # Avertissement -1 min (si possible), puis clôture
+        if total_seconds >= 120:
+            try:
+                await asyncio.sleep(total_seconds - 60)
+                for th in created_threads:
+                    try:
+                        await th.send("⏰ **Plus qu’1 minute** — échangez vos contacts si ça matche !")
+                    except Exception:
+                        pass
+                await asyncio.sleep(60)
+            except Exception:
+                pass
+        else:
+            await asyncio.sleep(total_seconds)
+
+        # Clôture + rapport .txt (threads listés)
+        closed_at = datetime.now(TZ)
+        lines = [
+            "====== RAPPORT SPEED GROUP ======",
+            f"Session ID : {session_id}",
+            f"Guild      : {interaction.guild.name} (id={interaction.guild.id})",
+            f"Lancé par  : {interaction.user} (id={interaction.user.id})",
+            f"Début      : {started_at.strftime('%d/%m/%Y %H:%M:%S')}",
+            f"Fin        : {closed_at.strftime('%d/%m/%Y %H:%M:%S')}",
+            f"Durée      : {nice_duration}",
+            f"Threads    : {len(created_threads)}",
+            "",
+            "Groupes & Threads :"
+        ]
+        for th in created_threads:
+            try:
+                await th.edit(archived=True, locked=True)
+            except Exception:
+                pass
+            url = f"https://discord.com/channels/{interaction.guild.id}/{th.id}"
+            lines.append(f"- {th.name}  ->  {url}  (id={th.id})")
+
+        report_txt = "\n".join(lines) + "\n"
+        log_ch = interaction.guild.get_channel(CH_LOGS) if CH_LOGS else None
+        if isinstance(log_ch, discord.TextChannel):
+            try:
+                with tempfile.NamedTemporaryFile("w", delete=False, prefix=f"speedgroup_{session_id}_", suffix=".txt", encoding="utf-8") as tmp:
+                    tmp.write(report_txt)
+                    tmp_path = tmp.name
+                await log_ch.send(
+                    content=f"{now_ts()} 📄 **Rapport SpeedGroup** — {nice_duration} • {len(created_threads)} thread(s)",
+                    file=discord.File(tmp_path, filename=f"speedgroup_{session_id}.txt")
+                )
+            except Exception:
+                try:
+                    await log_ch.send(f"{now_ts()} 📄 **Rapport SpeedGroup**\n```\n{report_txt}\n```")
                 except Exception:
                     pass
 
@@ -960,6 +1147,147 @@ class DiagCog(commands.Cog, name="Diag"):
             await interaction.response.send_message("🧹 Global slash **purgées**. Il ne reste que les guild-only.", ephemeral=True)
         except Exception as e:
             await interaction.response.send_message(f"⚠️ Clear globals fail : {e}", ephemeral=True)
+
+# -------------------- Help & Stats --------------------
+def _profile_genre(p: Dict[str,Any]) -> str:
+    g = (p.get("genre") or "").strip().lower()
+    if g.startswith("f"): return "F"
+    if g.startswith("h"): return "H"
+    return "?"
+
+def _ages(profiles: List[Dict[str,Any]]) -> List[int]:
+    vals = []
+    for p in profiles:
+        try:
+            a = int(p.get("age", 0))
+            if 18 <= a <= 99:
+                vals.append(a)
+        except Exception:
+            pass
+    return vals
+def _mean(nums: List[int]) -> Optional[float]:
+    return round(sum(nums)/len(nums), 1) if nums else None
+def _median(nums: List[int]) -> Optional[float]:
+    if not nums: return None
+    s = sorted(nums); n = len(s); mid = n//2
+    if n % 2: return float(s[mid])
+    return round((s[mid-1] + s[mid]) / 2, 1)
+
+class RencontreHelpCog(commands.Cog, name="RencontreHelp"):
+    def __init__(self, bot: commands.Bot): self.bot = bot
+
+    @app_commands.command(name="rencontre_help", description="Affiche les commandes principales du bot Rencontre")
+    @app_commands.guilds(GUILD_OBJ)
+    async def rencontre_help(self, interaction: discord.Interaction):
+        e = discord.Embed(
+            title="📘 Aide — Miri Rencontre",
+            description="Commandes principales pour gérer profils et soirées.",
+            color=BRAND_COLOR
+        )
+        e.add_field(
+            name="Profils",
+            value=(
+                "• `/resetprofil` — Supprime **votre** profil (+ retire le rôle)\n"
+                "• Bouton **🗑️** sous un profil — Supprime le profil (owner/admin/autorisé)\n"
+            ),
+            inline=False
+        )
+        e.add_field(
+            name="Panneau d’inscription",
+            value=(
+                "• `/speedpanel` — Publie/reconstruit le panneau **Je participe**\n"
+                "• `/speedsignups list` — Liste les inscrits\n"
+                "• `/speedsignups clear` — Réinitialise les inscrits\n"
+            ),
+            inline=False
+        )
+        e.add_field(
+            name="Soirées",
+            value=(
+                "• `/speeddating` — **Couples** privés (2 par thread) — `couples`, `duree`, `autopanel`\n"
+                "• `/speedgroup` — **Groupes** privés (N par thread) — `groupe_taille`, `duree`, `autopanel`\n"
+            ),
+            inline=False
+        )
+        e.add_field(
+            name="Owners & Permissions",
+            value=(
+                "• `/owners add/remove/list` — Owners (utilisateurs)\n"
+                "• `/ownerroles add/remove/list` — Owners (rôles)\n"
+            ),
+            inline=False
+        )
+        e.set_footer(text="Tip : durées comme 20m, 30m, 1h, 1h30")
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+class RencontreStatsCog(commands.Cog, name="RencontreStats"):
+    def __init__(self, bot: commands.Bot): self.bot = bot
+
+    @app_commands.command(name="rencontre_stats", description="Stats actuelles : profils, inscrits, matches")
+    @app_commands.guilds(GUILD_OBJ)
+    async def rencontre_stats(self, interaction: discord.Interaction):
+        data = storage.data
+
+        profiles_map: Dict[str,Dict[str,Any]] = data.get("profiles", {})
+        profiles = list(profiles_map.values())
+        total_profils = len(profiles)
+        f_count = sum(1 for p in profiles if _profile_genre(p) == "F")
+        h_count = sum(1 for p in profiles if _profile_genre(p) == "H")
+        other_count = total_profils - f_count - h_count
+
+        ages = _ages(profiles)
+        age_mean = _mean(ages)
+        age_median = _median(ages)
+
+        signups_ids = storage.get_signups()
+        signups_total = len(signups_ids)
+        signups_f = signups_h = signups_other = 0
+        for uid in signups_ids:
+            p = profiles_map.get(str(uid))
+            g = _profile_genre(p) if p else "?"
+            if g == "F": signups_f += 1
+            elif g == "H": signups_h += 1
+            else: signups_other += 1
+
+        matches = data.get("matches", [])
+        total_matches = len(matches) if isinstance(matches, list) else 0
+
+        last_run_ts = float(data.get("speed_last_run", 0.0) or 0.0)
+        last_run_str = datetime.fromtimestamp(last_run_ts, TZ).strftime("%d/%m/%Y %H:%M") if last_run_ts > 0 else "—"
+
+        e = discord.Embed(
+            title="📊 Stats Rencontre (instantané)",
+            description="Vue d’ensemble actuelle (aucune donnée individuelle).",
+            color=BRAND_COLOR
+        )
+        e.add_field(
+            name="Profils actifs",
+            value=f"Total **{total_profils}**  •  F **{f_count}**  H **{h_count}**  Autres **{other_count}**",
+            inline=False
+        )
+        if age_mean is not None or age_median is not None:
+            e.add_field(
+                name="Âges",
+                value=f"Moyenne **{age_mean or '—'}**  •  Médiane **{age_median or '—'}**  (n={len(ages)})",
+                inline=False
+            )
+        e.add_field(
+            name="Inscriptions en cours",
+            value=f"Total **{signups_total}**  •  F **{signups_f}**  H **{signups_h}**  Autres **{signups_other}**",
+            inline=False
+        )
+        e.add_field(
+            name="Matches (cumul)",
+            value=f"**{total_matches}**",
+            inline=True
+        )
+        e.add_field(
+            name="Dernier Speed lancé",
+            value=last_run_str,
+            inline=True
+        )
+        e.set_footer(text=f"Miri • {datetime.now(TZ).strftime('%d/%m/%Y %H:%M')}")
+        await interaction.response.send_message(embed=e, ephemeral=True)
 
 # -------------------- Accueil Auto --------------------
 async def ensure_welcome_panel(bot: commands.Bot):
@@ -1013,7 +1341,10 @@ class RencontreBot(commands.Bot):
         await self.add_cog(SpeedPanelCog(self))
         await self.add_cog(AdminCog(self))
         await self.add_cog(SpeedCog(self))
+        await self.add_cog(SpeedGroupCog(self))
         await self.add_cog(DiagCog(self))
+        await self.add_cog(RencontreHelpCog(self))
+        await self.add_cog(RencontreStatsCog(self))
         self.add_view(StartFormView())
         self.add_view(SpeedPanelView())
 
@@ -1046,6 +1377,13 @@ class RencontreBot(commands.Bot):
         sess = dm_sessions[uid]
         dm_ch: discord.DMChannel = message.channel  # type: ignore
         content = (message.content or "").strip()
+
+        # Timeout session (20 min)
+        if time.time() - sess.get("ts", 0) > 20*60:
+            dm_sessions.pop(uid, None)
+            await dm_ch.send("⏳ Session expirée. Clique **Démarrer** pour reprendre.")
+            return
+        sess["ts"] = time.time()
 
         # Étape 0 — âge
         if sess["step"] == 0:
@@ -1102,14 +1440,14 @@ class RencontreBot(commands.Bot):
             photo_url = None
             if message.attachments:
                 att = message.attachments[0]
-                if att.content_type and att.content_type.startswith("image/"):
+                if att.content_type and att.content_type.startswith("image/") and att.size <= 10*1024*1024:
                     photo_url = att.url
             if not photo_url and content.startswith("http"):
                 if re.search(r"\.(png|jpe?g|gif|webp)(\?|$)", content, re.I):
                     photo_url = content
 
             if not photo_url:
-                await dm_ch.send("⚠️ Envoie une **image** (pièce jointe) ou un **lien** direct (png/jpg/gif/webp).")
+                await dm_ch.send("⚠️ Envoie une **image** (pièce jointe <10 MB) ou un **lien** direct (png/jpg/gif/webp).")
                 return
 
             sess["answers"]["photo_url"] = photo_url
@@ -1144,12 +1482,15 @@ class RencontreBot(commands.Bot):
 
             dm_sessions.pop(uid, None)
             await dm_ch.send("✅ **Profil enregistré.** Il a été publié sur le serveur. Tu peux le modifier/supprimer via les boutons sous ton profil.")
+            # log discret création
+            ref = storage.get_profile_msg(uid)
+            await send_log_profile_event(guild, "créé", uid, ref)
             return
 
     async def on_member_remove(self, member: discord.Member):
-        # Auto-clean : supprime profil + message publié quand un membre quitte
+        # Auto-clean silencieux : supprime profil + message publié + rôle, SANS log
         uid = member.id
-        await full_profile_reset(member.guild, uid, log_reason="Leave cleanup")
+        await full_profile_reset(member.guild, uid, log_reason=None)
 
 # -------------------- RUN --------------------
 if not DISCORD_TOKEN:

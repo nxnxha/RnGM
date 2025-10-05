@@ -1,6 +1,23 @@
+
 # ================================================================
-# 🌹 MIRI RENCONTRE — BOT DISCORD COMPLET (Final)
+# 🌹 MIRI RENCONTRE — BOT DISCORD COMPLET (Final Downloadable)
 # ================================================================
+# Caractéristiques principales :
+# - Panneau d’accueil automatique (sombre & épuré) avec bouton "Créer mon profil"
+# - Création de profil en DM (âge, genre, attirance, passions, activité, photo)
+# - Affichage de profils avec embed stylé + boutons emoji-only persistants (❤️ ❌ 📩 🗑️)
+# - Animation douce sur le like
+# - Bouton 📩 via MODAL pour envoyer un premier message (DM) + logs détaillés (qui → qui + extrait)
+# - Suppression de profil retire aussi le rôle d’accès
+# - Logs élégants (embeds colorés) pour toutes les interactions
+# - Speed Dating : création de threads privés par paires, alerte -1 min, suppression/archivage fin, rapport embed
+# - Commandes claires : /rencontre_help /rencontre_info /rencontre_stats /setcooldown /owners /rencontreban /speeddating
+# - Aucune pollution de logs lors des leaves (nettoyage silencieux)
+#
+# Dépendances : discord.py 2.4+ (pip install -U discord.py)
+# Variables d’environnement requises : DISCORD_TOKEN, GUILD_ID, ROLE_ACCESS, CH_GIRLS, CH_BOYS, CH_SPEED, CH_LOGS, CH_WELCOME
+# ================================================================
+
 import os, re, json, asyncio, time, random
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple
@@ -29,8 +46,8 @@ BRAND_COLOR   = 0x7C3AED
 TZ = ZoneInfo("Europe/Paris")
 
 # Cooldowns par défaut (secondes) — modifiables par /setcooldown
-LIKE_COOLDOWN    = 600
-CONTACT_COOLDOWN = 600
+LIKE_COOLDOWN_DEFAULT    = 600
+CONTACT_COOLDOWN_DEFAULT = 600
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -52,8 +69,8 @@ class Storage:
             "banned_users": [],
             "owners": [],
             "welcome_panel": None,
-            "like_cooldown": LIKE_COOLDOWN,
-            "contact_cooldown": CONTACT_COOLDOWN,
+            "like_cooldown": LIKE_COOLDOWN_DEFAULT,
+            "contact_cooldown": CONTACT_COOLDOWN_DEFAULT,
         }
         self.load()
 
@@ -123,9 +140,8 @@ class Storage:
             await self.save()
 
 storage = Storage(DATA_FILE)
-# Recharge cooldowns sauvegardés
-LIKE_COOLDOWN    = int(storage.data.get("like_cooldown", LIKE_COOLDOWN))
-CONTACT_COOLDOWN = int(storage.data.get("contact_cooldown", CONTACT_COOLDOWN))
+LIKE_COOLDOWN    = int(storage.data.get("like_cooldown", LIKE_COOLDOWN_DEFAULT))
+CONTACT_COOLDOWN = int(storage.data.get("contact_cooldown", CONTACT_COOLDOWN_DEFAULT))
 
 # ================================================================
 # UTILS & LOGS
@@ -175,7 +191,6 @@ async def full_profile_reset(
     reason: str = "Suppression profil",
     do_log: bool = True
 ):
-    # supprime data + message publié + retire rôle
     ref = storage.get_profile_msg(uid)
     await storage.delete_profile_data(uid)
     if ref:
@@ -191,20 +206,14 @@ async def full_profile_reset(
     if do_log:
         await send_log_embed(guild, "Profil supprimé", f"Profil supprimé ({reason})", member, 0xF43F5E)
 
-# parse durations like "25m", "1h30", "90"
 def parse_duration_to_seconds(s: str) -> int:
     s = (s or "").strip().lower().replace(" ", "")
-    if not s:
-        return 5*60
-    if re.fullmatch(r"\d+", s):
-        return max(60, int(s)*60)
+    if not s: return 5*60
+    if re.fullmatch(r"\d+", s): return max(60, int(s)*60)
     m = re.fullmatch(r"(\d+)h(\d+)?m?$", s)
-    if m:
-        h = int(m.group(1)); mn = int(m.group(2) or 0)
-        return max(60, h*3600 + mn*60)
+    if m: return max(60, int(m.group(1))*3600 + int(m.group(2) or 0)*60)
     m2 = re.fullmatch(r"(\d+)m(in)?$", s)
-    if m2:
-        return max(60, int(m2.group(1))*60)
+    if m2: return max(60, int(m2.group(1))*60)
     return 5*60
 
 # ================================================================
@@ -254,6 +263,63 @@ async def publish_or_update_profile(guild: discord.Guild, member: discord.Member
 like_cooldowns: Dict[Tuple[int, int], float]    = {}
 contact_cooldowns: Dict[Tuple[int, int], float] = {}
 
+# --------- Modal de contact ---------
+class ContactModal(discord.ui.Modal, title="💌 Premier message"):
+    def __init__(self, target_id: int):
+        super().__init__(timeout=300)
+        self.target_id = target_id
+        self.message = discord.ui.TextInput(
+            label="Ton message (max 300 caractères)",
+            style=discord.TextStyle.paragraph,
+            max_length=300,
+            required=True,
+            placeholder="Dis quelque chose de sympa et respectueux 💞"
+        )
+        self.add_item(self.message)
+
+    async def on_submit(self, inter: discord.Interaction):
+        author = inter.user
+        guild: Optional[discord.Guild] = inter.guild
+        if not guild:
+            await inter.response.send_message("⚠️ Utilisable sur le serveur.", ephemeral=True)
+            return
+        target = guild.get_member(self.target_id)
+        if not target:
+            await inter.response.send_message("⚠️ Membre introuvable.", ephemeral=True)
+            return
+
+        content = self.message.value.strip()
+        if not content:
+            await inter.response.send_message("⚠️ Message vide.", ephemeral=True)
+            return
+
+        # Envoi DM
+        sent_ok = False
+        try:
+            dm = await target.create_dm()
+            txt = (
+                f"💌 **{author.display_name}** souhaite te parler !\n"
+                f"🗨️ “{content}”\n\n"
+                f"❤️ Tu peux répondre directement à ce message."
+            )
+            await dm.send(txt)
+            sent_ok = True
+        except Exception:
+            sent_ok = False
+
+        if sent_ok:
+            await inter.response.send_message("📨 Message envoyé avec succès 💞", ephemeral=True)
+            excerpt = (content[:180] + "…") if len(content) > 180 else content
+            await send_log_embed(
+                guild,
+                "Contact envoyé",
+                f"👤 {author.mention} → <@{self.target_id}>\n✉️ “{excerpt}”",
+                user=author,
+                color=0x3B82F6
+            )
+        else:
+            await inter.response.send_message("⚠️ Impossible d’envoyer le DM (DM fermés ?).", ephemeral=True)
+
 class ProfileView(discord.ui.View):
     def __init__(self, owner_id: int):
         super().__init__(timeout=None)
@@ -270,48 +336,44 @@ class ProfileView(discord.ui.View):
     @discord.ui.button(emoji="❤️", style=discord.ButtonStyle.success, custom_id="profile_like")
     async def like(self, inter: discord.Interaction, btn: discord.ui.Button):
         if inter.user.id == self.owner_id:
-            await inter.response.send_message("💡 Tu ne peux pas te liker toi-même.", ephemeral=True)
-            return
+            await inter.response.send_message("💡 Tu ne peux pas te liker toi-même.", ephemeral=True); return
         if not self._check_cd(like_cooldowns, inter.user.id, int(storage.data.get("like_cooldown", LIKE_COOLDOWN))):
-            await inter.response.send_message("⏳ Attends un peu avant de reliker ❤️", ephemeral=True)
-            return
+            await inter.response.send_message("⏳ Attends un peu avant de reliker ❤️", ephemeral=True); return
 
+        # Animation
         await inter.response.defer(ephemeral=True)
         try:
             msg = await inter.followup.send("💞 Une connexion se crée...", ephemeral=True)
-            await asyncio.sleep(1.3)
+            await asyncio.sleep(1.2)
             await msg.edit(content="🌹 Sentiment partagé ou simple curiosité ? Le temps nous le dira.")
-            await asyncio.sleep(1.3)
+            await asyncio.sleep(1.2)
             await msg.edit(content="❤️ Like enregistré.")
         except Exception:
             await inter.followup.send("❤️ Like enregistré.", ephemeral=True)
 
         await send_log_embed(inter.guild, "Like", f"{inter.user.mention} a liké <@{self.owner_id}>", inter.user, 0xF472B6)
 
+    @discord.ui.button(emoji="❌", style=discord.ButtonStyle.secondary, custom_id="profile_pass")
+    async def _pass(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if inter.user.id == self.owner_id:
+            await inter.response.send_message("🙃 Tu ne peux pas passer sur toi-même.", ephemeral=True); return
+        await inter.response.send_message("👌 C’est noté.", ephemeral=True)
+        await send_log_embed(inter.guild, "Pass", f"{inter.user.mention} a passé <@{self.owner_id}>", inter.user, 0x9CA3AF)
+
     @discord.ui.button(emoji="📩", style=discord.ButtonStyle.primary, custom_id="profile_contact")
     async def contact(self, inter: discord.Interaction, btn: discord.ui.Button):
         if inter.user.id == self.owner_id:
-            await inter.response.send_message("🙃 Pas toi-même.", ephemeral=True)
-            return
+            await inter.response.send_message("🙃 Pas toi-même.", ephemeral=True); return
+        # Cooldown contact
         if not self._check_cd(contact_cooldowns, inter.user.id, int(storage.data.get("contact_cooldown", CONTACT_COOLDOWN))):
-            await inter.response.send_message("⏳ Attends un peu avant de recontacter 💌", ephemeral=True)
-            return
-        target = inter.guild.get_member(self.owner_id)
-        if not target:
-            await inter.response.send_message("⚠️ Membre introuvable.", ephemeral=True)
-            return
-        try:
-            dm = await target.create_dm()
-            await dm.send(f"💌 **{inter.user.display_name}** souhaite te parler !")
-            await inter.response.send_message("📨 Message envoyé.", ephemeral=True)
-        except Exception:
-            await inter.response.send_message("⚠️ DM impossible (DM fermés ?).", ephemeral=True)
+            await inter.response.send_message("⏳ Attends un peu avant d’envoyer un nouveau message 💌", ephemeral=True); return
+        # Ouvre le modal
+        await inter.response.send_modal(ContactModal(target_id=self.owner_id))
 
     @discord.ui.button(emoji="🗑️", style=discord.ButtonStyle.danger, custom_id="profile_delete")
     async def delete(self, inter: discord.Interaction, btn: discord.ui.Button):
         if inter.user.id != self.owner_id and not inter.user.guild_permissions.administrator and not storage.is_owner(inter.user.id):
-            await inter.response.send_message("❌ Tu ne peux pas supprimer ce profil.", ephemeral=True)
-            return
+            await inter.response.send_message("❌ Tu ne peux pas supprimer ce profil.", ephemeral=True); return
         await full_profile_reset(inter.guild, self.owner_id, "Suppression via bouton", do_log=True)
         await inter.response.send_message("✅ Profil supprimé avec succès.", ephemeral=True)
 
@@ -337,8 +399,7 @@ class StartView(discord.ui.View):
     @discord.ui.button(label="✨ Créer mon profil", emoji="🌹", style=discord.ButtonStyle.success, custom_id="start_profile")
     async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if storage.is_banned(interaction.user.id):
-            await interaction.response.send_message("🚫 Tu n’as pas accès à l’espace Rencontre.", ephemeral=True)
-            return
+            await interaction.response.send_message("🚫 Tu n’as pas accès à l’espace Rencontre.", ephemeral=True); return
         await interaction.response.send_message("📩 Regarde tes **DM** pour commencer la création 💞", ephemeral=True)
         try:
             dm = await interaction.user.create_dm()
@@ -460,7 +521,7 @@ class AdminCog(commands.Cog, name="Admin"):
     # Ban / Unban
     ban_group = app_commands.Group(name="rencontreban", description="Gérer l'accès Rencontre (admin)")
 
-    @ban_group.command(name="add", description="🚫 Bannir un membre de l’Espace Rencontre")
+    @ban_group.command(name="add", description="🚫 Bannir un membre de la Rencontre")
     @app_commands.checks.has_permissions(administrator=True)
     async def ban_add(self, inter: discord.Interaction, user: discord.Member, raison: Optional[str] = None):
         await storage.ban(user.id)
@@ -484,22 +545,22 @@ class AdminCog(commands.Cog, name="Admin"):
             names.append(m.mention if m else f"`{i}`")
         await inter.response.send_message("**Bannis Rencontre :** " + ", ".join(names), ephemeral=True)
 
-    # Owners (propriétaires du bot)
+    # Owners
     owners_group = app_commands.Group(name="owners", description="Gérer les propriétaires du bot")
 
-    @owners_group.command(name="add", description="Ajouter un propriétaire (admin)")
+    @owners_group.command(name="add", description="Ajouter un owner (admin)")
     @app_commands.checks.has_permissions(administrator=True)
     async def owners_add(self, inter: discord.Interaction, user: discord.Member):
         await storage.add_owner(user.id)
         await inter.response.send_message(f"✅ **{user.display_name}** ajouté comme owner.", ephemeral=True)
 
-    @owners_group.command(name="remove", description="Retirer un propriétaire (admin)")
+    @owners_group.command(name="remove", description="Retirer un owner (admin)")
     @app_commands.checks.has_permissions(administrator=True)
     async def owners_remove(self, inter: discord.Interaction, user: discord.Member):
         await storage.remove_owner(user.id)
         await inter.response.send_message(f"🗑️ **{user.display_name}** retiré des owners.", ephemeral=True)
 
-    @owners_group.command(name="list", description="Lister les propriétaires")
+    @owners_group.command(name="list", description="Lister les owners")
     async def owners_list(self, inter: discord.Interaction):
         ids = storage.data.get("owners", [])
         if not ids:
@@ -510,17 +571,17 @@ class AdminCog(commands.Cog, name="Admin"):
             mentions.append(m.mention if m else f"`{i}`")
         await inter.response.send_message("**Owners :** " + ", ".join(mentions), ephemeral=True)
 
-    # SpeedDating (simple, flexible)
+    # SpeedDating
     @app_commands.command(
         name="speeddating",
-        description="Créer des threads privés pour une soirée (participants via mentions dans le texte)."
+        description="Créer des threads privés pour une soirée (participants via mentions)."
     )
     @app_commands.describe(
         participants="Mentionne les participants dans un texte (ex: @a @b @c …)",
         couples="Nombre maximum de couples (paires) à créer",
         duree="Durée : ex 20m, 30m, 1h, 1h30…",
         nom="Nom d’événement (préfixe des threads)",
-        delete_after="Supprimer les threads à la fin (sinon archive+lock)"
+        delete_after="Supprimer les threads à la fin (True/False)"
     )
     async def speeddating(
         self,
@@ -531,7 +592,6 @@ class AdminCog(commands.Cog, name="Admin"):
         nom: Optional[str] = "Speed ⏳",
         delete_after: bool = True,
     ):
-        # Permissions: admin / owner / manage_channels
         u = inter.user
         if not (u.guild_permissions.administrator or u.guild_permissions.manage_channels or storage.is_owner(u.id)):
             await inter.response.send_message("❌ Tu n’es pas autorisé(e) à lancer une soirée.", ephemeral=True); return
@@ -540,7 +600,6 @@ class AdminCog(commands.Cog, name="Admin"):
         if not isinstance(ch_speed, discord.TextChannel):
             await inter.response.send_message("❌ Salon Speed Dating introuvable (CH_SPEED).", ephemeral=True); return
 
-        # Parse participants depuis string contenant des mentions
         ids = [int(m) for m in re.findall(r"<@!?(\d+)>", participants)]
         uniq_ids = []
         for i in ids:
@@ -570,7 +629,6 @@ class AdminCog(commands.Cog, name="Admin"):
         created_threads: List[discord.Thread] = []
         started_at = datetime.now(TZ)
 
-        # Créer les threads privés
         for a, b in pairs:
             name = f"{(nom or 'Speed ⏳').strip()} {a.display_name} × {b.display_name}"
             try:
@@ -591,7 +649,6 @@ class AdminCog(commands.Cog, name="Admin"):
 
         await inter.response.send_message(f"✅ **{len(created_threads)}** threads créés pour **{nice_duration}**.", ephemeral=True)
 
-        # Alerte -1 minute si possible
         if total_seconds >= 120:
             try:
                 await asyncio.sleep(total_seconds - 60)
@@ -605,7 +662,6 @@ class AdminCog(commands.Cog, name="Admin"):
 
         closed_at = datetime.now(TZ)
 
-        # Clore / supprimer threads
         for th in created_threads:
             try:
                 if delete_after:
@@ -630,7 +686,7 @@ class HelpCog(commands.Cog, name="Aide"):
         )
         e.add_field(
             name="👤 Utilisateurs",
-            value="• Bouton **✨ Créer mon profil** dans le panneau d’accueil\n• Interagir avec les profils via ❤️ / 📩\n• `/rencontre_info` — infos publiques",
+            value="• Bouton **✨ Créer mon profil** dans le panneau d’accueil\n• Interagir avec les profils via ❤️ / ❌ / 📩 / 🗑️\n• `/rencontre_info` — infos publiques",
             inline=False
         )
         e.add_field(

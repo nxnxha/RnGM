@@ -298,12 +298,9 @@ class ContactModal(discord.ui.Modal, title="💌 Premier message"):
         try:
             dm = await target.create_dm()
             txt = (
-                f"💌 **{author.display_name}** souhaite te parler !
-"
-                f"🗨️ “{content}”
-
-"
-                f"❤️ Tu peux répondre directement à ce message."
+                f"💌 **{author.display_name}** souhaite te parler !\n"
+                f"🗨️ « {self.msg.value} »\n"
+                f"💞 Tu peux répondre directement à ce message."
             )
             await dm.send(txt)
             sent_ok = True

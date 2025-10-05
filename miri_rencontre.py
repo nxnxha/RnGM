@@ -1,18 +1,12 @@
-
 # ================================================================
-# 🌹 MIRI RENCONTRE — BOT DISCORD COMPLET (Fixed)
+# 🌹 MIRI RENCONTRE — BOT DISCORD COMPLET (Reply + Slash + Logs)
 # ================================================================
-# - Accueil auto + bouton profil
-# - Profils (DM), embed compact (thumbnail), boutons emoji-only
-# - Modal de contact (DM) + logs clairs
-# - Suppression profil => retire rôle
-# - Speed Dating (threads), -1min warn, archive/suppr, rapport embed
-# - Commandes: /rencontre_help /rencontre_info /rencontre_stats /setcooldown
-#              /owners /rencontreban /speeddating
-# - Aucune alerte pour les leaves (nettoyage silencieux)
-#
-# Dépendances : discord.py >= 2.4  (pip install -U discord.py)
-# Vars d’env obligatoires : DISCORD_TOKEN, GUILD_ID
+# Dépendances : discord.py >= 2.4  →  pip install -U discord.py
+# Vars d’env obligatoires :
+#   DISCORD_TOKEN
+#   GUILD_ID          (par défaut 1382730341944397967)
+# Recommandées (IDs de salons/rôle) :
+#   ROLE_ACCESS, CH_GIRLS, CH_BOYS, CH_SPEED, CH_LOGS, CH_WELCOME
 # ================================================================
 
 import os, re, json, asyncio, time, random
@@ -62,13 +56,14 @@ class Storage:
         self.path = path
         self._lock = asyncio.Lock()
         self.data: Dict[str, Any] = {
-            "profiles": {},
-            "profile_msgs": {},
+            "profiles": {},          # uid -> dict
+            "profile_msgs": {},      # uid -> {channel_id, message_id}
             "banned_users": [],
             "owners": [],
-            "welcome_panel": None,
+            "welcome_panel": None,   # {channel_id, message_id}
             "like_cooldown": LIKE_COOLDOWN_DEFAULT,
             "contact_cooldown": CONTACT_COOLDOWN_DEFAULT,
+            "speed_sessions": {},    # session_id -> {threads:[ids], name, started_at, delete_after}
         }
         self.load()
 
@@ -295,7 +290,6 @@ class ContactModal(discord.ui.Modal, title="💌 Premier message"):
             await inter.response.send_message("⚠️ Message vide.", ephemeral=True)
             return
 
-        # Envoi DM
         sent_ok = False
         try:
             dm = await target.create_dm()
@@ -322,6 +316,63 @@ class ContactModal(discord.ui.Modal, title="💌 Premier message"):
         else:
             await inter.response.send_message("⚠️ Impossible d’envoyer le DM (DM fermés ?).", ephemeral=True)
 
+# --------- Modal de RÉPONSE ---------
+class ReplyModal(discord.ui.Modal, title="💬 Répondre en DM"):
+    def __init__(self, target_id: int):
+        super().__init__(timeout=300)
+        self.target_id = target_id
+        self.message = discord.ui.TextInput(
+            label="Ta réponse (max 400 caractères)",
+            style=discord.TextStyle.paragraph,
+            max_length=400,
+            required=True,
+            placeholder="Reste respectueux et clair ✨"
+        )
+        self.add_item(self.message)
+
+    async def on_submit(self, inter: discord.Interaction):
+        author = inter.user
+        guild = inter.guild
+        if not guild:
+            await inter.response.send_message("⚠️ Utilisable sur le serveur.", ephemeral=True)
+            return
+        target = guild.get_member(self.target_id)
+        if not target:
+            await inter.response.send_message("⚠️ Destinataire introuvable.", ephemeral=True)
+            return
+
+        content = self.message.value.strip()
+        if not content:
+            await inter.response.send_message("⚠️ Message vide.", ephemeral=True)
+            return
+
+        ok = False
+        try:
+            dm = await target.create_dm()
+            txt = (
+                f"💬 **Réponse de {author.display_name}**\n"
+                f"🗨️ « {content} »\n"
+                f"📎 (tu peux répondre à ce message)"
+            )
+            await dm.send(txt)
+            ok = True
+        except Exception:
+            ok = False
+
+        if ok:
+            await inter.response.send_message("🔁 Réponse envoyée ✔️", ephemeral=True)
+            excerpt = (content[:180] + "…") if len(content) > 180 else content
+            await send_log_embed(
+                guild,
+                "Réponse envoyée",
+                f"🔁 {author.mention} → <@{self.target_id}>\n✉️ “{excerpt}”",
+                user=author,
+                color=0x22C55E
+            )
+        else:
+            await inter.response.send_message("⚠️ DM non envoyé (DM fermés ?).", ephemeral=True)
+
+# --------- View de profil (boutons emoji-only persistants) ---------
 class ProfileView(discord.ui.View):
     def __init__(self, owner_id: int):
         super().__init__(timeout=None)
@@ -347,9 +398,9 @@ class ProfileView(discord.ui.View):
         await inter.response.defer(ephemeral=True)
         try:
             msg = await inter.followup.send("💞 Une connexion se crée...", ephemeral=True)
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(1.0)
             await msg.edit(content="🌹 Sentiment partagé ou simple curiosité ? Le temps nous le dira.")
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(1.0)
             await msg.edit(content="❤️ Like enregistré.")
         except Exception:
             await inter.followup.send("❤️ Like enregistré.", ephemeral=True)
@@ -380,9 +431,9 @@ class ProfileView(discord.ui.View):
             await inter.response.send_message("❌ Tu ne peux pas supprimer ce profil.", ephemeral=True)
             return
         await full_profile_reset(inter.guild, self.owner_id, "Suppression via bouton", do_log=True)
-        await inter.response.send_message("✅ Profil supprimé avec succès.", ephemeral=True)
+        await inter.response.send_message("✅ Profil supprimé et rôle retiré.", ephemeral=True)
 
-# Accueil (DM)
+# --------- Accueil / DM ---------
 dm_sessions: Dict[int, Dict[str, Any]] = {}
 
 async def _send_next_step(dm_ch: discord.DMChannel, uid: int):
@@ -459,12 +510,16 @@ async def ensure_welcome_panel(bot: commands.Bot):
     await storage.save()
 
 # ================================================================
-# SPEED DATING — Rapport embed
+# SPEED DATING — outils + rapport embed
 # ================================================================
+def nice_duration(seconds: int) -> str:
+    mins = seconds // 60
+    h, m = mins // 60, mins % 60
+    return f"{h}h{m:02d}" if h else f"{m}m"
+
 async def send_speed_report_embed(
     guild: discord.Guild,
     organizer: discord.Member,
-    couples: int,
     duration_str: str,
     created_threads: List[discord.Thread],
     started_at: datetime,
@@ -509,7 +564,17 @@ class AdminCog(commands.Cog, name="Admin"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    # -------- Sync (admin) --------
+    @app_commands.command(name="sync", description="Resynchroniser les commandes slash du bot (admin)")
+    @app_commands.guilds(GUILD_OBJ)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def sync_cmds(self, inter: discord.Interaction):
+        cmds = await inter.client.tree.sync(guild=inter.guild)
+        await inter.response.send_message(f"✅ {len(cmds)} commandes synchronisées.", ephemeral=True)
+
+    # -------- Cooldowns --------
     @app_commands.command(name="setcooldown", description="Modifier le cooldown des interactions (admin)")
+    @app_commands.guilds(GUILD_OBJ)
     @app_commands.describe(type="like ou contact", minutes="durée en minutes (min 1)")
     @app_commands.checks.has_permissions(administrator=True)
     async def setcooldown(self, inter: discord.Interaction, type: str, minutes: int):
@@ -528,7 +593,9 @@ class AdminCog(commands.Cog, name="Admin"):
         await inter.response.send_message(f"✅ Cooldown `{type}` mis à **{minutes} min**.", ephemeral=True)
         await send_log_embed(inter.guild, "Configuration modifiée", f"{inter.user.mention} a mis `{type}` à **{minutes} min**.", inter.user, 0x7DD3FC)
 
+    # -------- Stats (admin) --------
     @app_commands.command(name="rencontre_stats", description="📊 Statistiques de l’Espace Rencontre (admin)")
+    @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(administrator=True)
     async def rencontre_stats(self, inter: discord.Interaction):
         total = len(storage.data.get("profiles", {}))
@@ -553,10 +620,11 @@ class AdminCog(commands.Cog, name="Admin"):
         e.set_footer(text="Miri Rencontre • Dashboard Admin")
         await inter.response.send_message(embed=e, ephemeral=True)
 
-    # Ban / Unban
+    # -------- Rencontre BAN --------
     ban_group = app_commands.Group(name="rencontreban", description="Gérer l'accès Rencontre (admin)")
 
     @ban_group.command(name="add", description="🚫 Bannir un membre de la Rencontre")
+    @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(administrator=True)
     async def ban_add(self, inter: discord.Interaction, user: discord.Member, raison: Optional[str] = None):
         await storage.ban(user.id)
@@ -564,12 +632,14 @@ class AdminCog(commands.Cog, name="Admin"):
         await inter.response.send_message(f"🚫 **{user.display_name}** banni de la Rencontre.", ephemeral=True)
 
     @ban_group.command(name="remove", description="✅ Débannir un membre")
+    @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(administrator=True)
     async def ban_remove(self, inter: discord.Interaction, user: discord.Member):
         await storage.unban(user.id)
         await inter.response.send_message(f"✅ **{user.display_name}** débanni.", ephemeral=True)
 
     @ban_group.command(name="list", description="Voir la liste des bannis")
+    @app_commands.guilds(GUILD_OBJ)
     async def ban_list(self, inter: discord.Interaction):
         ids = storage.list_bans()
         if not ids:
@@ -581,22 +651,25 @@ class AdminCog(commands.Cog, name="Admin"):
             names.append(m.mention if m else f"`{i}`")
         await inter.response.send_message("**Bannis Rencontre :** " + ", ".join(names), ephemeral=True)
 
-    # Owners
+    # -------- Owners --------
     owners_group = app_commands.Group(name="owners", description="Gérer les propriétaires du bot")
 
     @owners_group.command(name="add", description="Ajouter un owner (admin)")
+    @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(administrator=True)
     async def owners_add(self, inter: discord.Interaction, user: discord.Member):
         await storage.add_owner(user.id)
         await inter.response.send_message(f"✅ **{user.display_name}** ajouté comme owner.", ephemeral=True)
 
     @owners_group.command(name="remove", description="Retirer un owner (admin)")
+    @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(administrator=True)
     async def owners_remove(self, inter: discord.Interaction, user: discord.Member):
         await storage.remove_owner(user.id)
         await inter.response.send_message(f"🗑️ **{user.display_name}** retiré des owners.", ephemeral=True)
 
     @owners_group.command(name="list", description="Lister les owners")
+    @app_commands.guilds(GUILD_OBJ)
     async def owners_list(self, inter: discord.Interaction):
         ids = storage.data.get("owners", [])
         if not ids:
@@ -608,11 +681,12 @@ class AdminCog(commands.Cog, name="Admin"):
             mentions.append(m.mention if m else f"`{i}`")
         await inter.response.send_message("**Owners :** " + ", ".join(mentions), ephemeral=True)
 
-    # SpeedDating
+    # -------- SpeedDating --------
     @app_commands.command(
         name="speeddating",
         description="Créer des threads privés pour une soirée (participants via mentions)."
     )
+    @app_commands.guilds(GUILD_OBJ)
     @app_commands.describe(
         participants="Mentionne les participants (ex: @a @b @c …)",
         couples="Nombre maximum de couples (paires)",
@@ -655,9 +729,7 @@ class AdminCog(commands.Cog, name="Admin"):
             return
 
         total_seconds = parse_duration_to_seconds(duree)
-        mins = total_seconds // 60
-        h, mn = mins // 60, mins % 60
-        nice_duration = f"{h}h{mn:02d}" if h else f"{mn}m"
+        ndur = nice_duration(total_seconds)
 
         random.shuffle(members)
         pairs: List[Tuple[discord.Member, discord.Member]] = []
@@ -669,6 +741,7 @@ class AdminCog(commands.Cog, name="Admin"):
 
         created_threads: List[discord.Thread] = []
         started_at = datetime.now(TZ)
+        session_id = str(int(started_at.timestamp()))
 
         for a, b in pairs:
             name = f"{(nom or 'Speed ⏳').strip()} {a.display_name} × {b.display_name}"
@@ -682,15 +755,25 @@ class AdminCog(commands.Cog, name="Admin"):
                 await th.add_user(a)
                 await th.add_user(b)
                 await th.send(
-                    f"Bienvenue {a.mention} et {b.mention} — vous avez **{nice_duration}** ⏳.\n"
+                    f"Bienvenue {a.mention} et {b.mention} — vous avez **{ndur}** ⏳.\n"
                     "Soyez respectueux·ses. Le fil sera **clôturé** à la fin."
                 )
                 created_threads.append(th)
             except Exception:
                 continue
 
-        await inter.response.send_message(f"✅ **{len(created_threads)}** threads créés pour **{nice_duration}**.", ephemeral=True)
+        # sauvegarde session
+        storage.data["speed_sessions"][session_id] = {
+            "threads": [t.id for t in created_threads],
+            "name": nom or "Speed ⏳",
+            "started_at": started_at.isoformat(),
+            "delete_after": bool(delete_after),
+        }
+        await storage.save()
 
+        await inter.response.send_message(f"✅ **{len(created_threads)}** threads créés pour **{ndur}**. (session `{session_id}`)", ephemeral=True)
+
+        # minuterie
         if total_seconds >= 120:
             try:
                 await asyncio.sleep(total_seconds - 60)
@@ -706,7 +789,7 @@ class AdminCog(commands.Cog, name="Admin"):
             await asyncio.sleep(total_seconds)
 
         closed_at = datetime.now(TZ)
-
+        # clôture
         for th in created_threads:
             try:
                 if delete_after:
@@ -716,25 +799,97 @@ class AdminCog(commands.Cog, name="Admin"):
             except Exception:
                 pass
 
-        await send_speed_report_embed(inter.guild, inter.user, couples, nice_duration, created_threads, started_at, closed_at)
+        await send_speed_report_embed(inter.guild, inter.user, ndur, created_threads, started_at, closed_at)
 
+    @app_commands.command(name="speeddating_list", description="Lister les sessions SpeedDating actives/connues")
+    @app_commands.guilds(GUILD_OBJ)
+    async def speeddating_list(self, inter: discord.Interaction):
+        sessions = storage.data.get("speed_sessions", {})
+        if not sessions:
+            await inter.response.send_message("Aucune session enregistrée.", ephemeral=True)
+            return
+        lines = []
+        for sid, s in sessions.items():
+            dt = s.get("started_at", "")[:16].replace("T", " ")
+            lines.append(f"• `{sid}` — {s.get('name','Speed ⏳')} — {len(s.get('threads', []))} threads — {dt}")
+        e = discord.Embed(title="🗂️ Sessions SpeedDating", description="\n".join(lines), color=0xA78BFA)
+        await inter.response.send_message(embed=e, ephemeral=True)
+
+    @app_commands.command(name="speeddating_stop", description="Clôturer une session : archiver/verrouiller ou supprimer")
+    @app_commands.guilds(GUILD_OBJ)
+    @app_commands.describe(session_id="ID de session", delete="True: supprimer les threads, False: archiver/locker")
+    @app_commands.checks.has_permissions(manage_channels=True)
+    async def speeddating_stop(self, inter: discord.Interaction, session_id: str, delete: bool = True):
+        s = storage.data.get("speed_sessions", {}).get(session_id)
+        if not s:
+            await inter.response.send_message("Session introuvable.", ephemeral=True)
+            return
+        ch = inter.guild.get_channel(CH_SPEED)
+        done = 0
+        if isinstance(ch, discord.TextChannel):
+            for tid in s.get("threads", []):
+                try:
+                    th = await ch.fetch_thread(tid)
+                    if delete:
+                        await th.delete()
+                    else:
+                        await th.edit(archived=True, locked=True)
+                    done += 1
+                except Exception:
+                    continue
+        storage.data["speed_sessions"].pop(session_id, None)
+        await storage.save()
+        await inter.response.send_message(f"✅ Session `{session_id}` clôturée ({done} threads).", ephemeral=True)
+
+    @app_commands.command(name="speeddating_report", description="Forcer l’envoi d’un rapport (dernière session)")
+    @app_commands.guilds(GUILD_OBJ)
+    async def speeddating_report(self, inter: discord.Interaction, session_id: Optional[str] = None):
+        sessions = storage.data.get("speed_sessions", {})
+        if not sessions:
+            await inter.response.send_message("Aucune session en mémoire.", ephemeral=True)
+            return
+        if not session_id:
+            # prend la plus récente
+            session_id = sorted(sessions.keys())[-1]
+        s = sessions.get(session_id)
+        if not s:
+            await inter.response.send_message("Session introuvable.", ephemeral=True)
+            return
+        ch = inter.guild.get_channel(CH_SPEED)
+        threads = []
+        if isinstance(ch, discord.TextChannel):
+            for tid in s.get("threads", []):
+                try:
+                    th = await ch.fetch_thread(tid)
+                    threads.append(th)
+                except Exception:
+                    continue
+        started_at = datetime.fromisoformat(s.get("started_at")).astimezone(TZ) if s.get("started_at") else datetime.now(TZ)
+        await send_speed_report_embed(inter.guild, inter.user, "?", threads, started_at, datetime.now(TZ))
+        await inter.response.send_message("📨 Rapport envoyé.", ephemeral=True)
+
+# -------- Aide (slash) --------
 class HelpCog(commands.Cog, name="Aide"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
     @app_commands.command(name="rencontre_help", description="Affiche l’aide du bot Rencontre")
+    @app_commands.guilds(GUILD_OBJ)
     async def rencontre_help(self, inter: discord.Interaction):
         user_help = (
-            "• Bouton **✨ Créer mon profil** dans le panneau d’accueil\n"
-            "• Interagir avec les profils via ❤️ / ❌ / 📩 / 🗑️\n"
-            "• `/rencontre_info` — infos publiques"
+            "• Panneau d’accueil → **✨ Créer mon profil**\n"
+            "• Sur un profil : ❤️ / ❌ / 📩 / 🗑️\n"
+            "• `/rencontre_info` — infos publiques\n"
+            "• `/reply` — répondre en DM via modal"
         )
         admin_help = (
             "• `/speeddating participants:<mentions> couples:<n> duree:<30m> nom:<txt> delete_after:<bool>`\n"
+            "• `/speeddating_list` / `/speeddating_stop` / `/speeddating_report`\n"
             "• `/setcooldown like|contact <minutes>`\n"
             "• `/rencontre_stats`\n"
             "• `/rencontreban add/remove/list`\n"
-            "• `/owners add/remove/list`"
+            "• `/owners add/remove/list`\n"
+            "• `/sync`"
         )
         e = discord.Embed(
             title="🌹 Aide — Miri Rencontre",
@@ -747,11 +902,13 @@ class HelpCog(commands.Cog, name="Aide"):
         e.set_footer(text="Miri Rencontre • Laissez la magie opérer ✨")
         await inter.response.send_message(embed=e, ephemeral=True)
 
+# -------- Infos publiques --------
 class PublicInfoCog(commands.Cog, name="Infos"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
     @app_commands.command(name="rencontre_info", description="📖 Infos publiques de l’Espace Rencontre")
+    @app_commands.guilds(GUILD_OBJ)
     async def rencontre_info(self, inter: discord.Interaction):
         total = len(storage.data.get("profiles", {}))
         published = len(storage.data.get("profile_msgs", {}))
@@ -771,6 +928,17 @@ class PublicInfoCog(commands.Cog, name="Infos"):
         e.set_footer(text="Miri Rencontre • Ensemble, ça matche ✨")
         await inter.response.send_message(embed=e, ephemeral=False)
 
+# -------- Répondre en DM via MODAL (slash) --------
+class ReplyCog(commands.Cog, name="Reply"):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    @app_commands.command(name="reply", description="Ouvrir un modal pour répondre en DM à un membre")
+    @app_commands.guilds(GUILD_OBJ)
+    @app_commands.describe(user="Destinataire de la réponse")
+    async def reply(self, inter: discord.Interaction, user: discord.Member):
+        await inter.response.send_modal(ReplyModal(target_id=user.id))
+
 # ================================================================
 # BOT PRINCIPAL
 # ================================================================
@@ -783,7 +951,8 @@ class RencontreBot(commands.Bot):
         await self.add_cog(AdminCog(self))
         await self.add_cog(HelpCog(self))
         await self.add_cog(PublicInfoCog(self))
-        # Views persistantes
+        await self.add_cog(ReplyCog(self))
+        # Views persistantes (custom_id fixés + timeout=None)
         self.add_view(ProfileView(owner_id=0))
         self.add_view(StartView())
 

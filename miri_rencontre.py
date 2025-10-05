@@ -1,21 +1,21 @@
 
 # ================================================================
-# 🌹 MIRI RENCONTRE — BOT DISCORD COMPLET (Final Downloadable)
+# 🌹 MIRI RENCONTRE — BOT DISCORD COMPLET (Final)
 # ================================================================
-# Caractéristiques principales :
-# - Panneau d’accueil automatique (sombre & épuré) avec bouton "Créer mon profil"
+# Fonctions principales :
+# - Panneau d’accueil auto (sombre & épuré) avec bouton "Créer mon profil"
 # - Création de profil en DM (âge, genre, attirance, passions, activité, photo)
-# - Affichage de profils avec embed stylé + boutons emoji-only persistants (❤️ ❌ 📩 🗑️)
+# - Affichage profils avec embed stylé + boutons emoji-only persistants (❤️ ❌ 📩 🗑️)
 # - Animation douce sur le like
-# - Bouton 📩 via MODAL pour envoyer un premier message (DM) + logs détaillés (qui → qui + extrait)
-# - Suppression de profil retire aussi le rôle d’accès
+# - Bouton 📩 via MODAL (DM) + logs détaillés (qui → qui + extrait)
+# - Suppression de profil retire le rôle d’accès
 # - Logs élégants (embeds colorés) pour toutes les interactions
-# - Speed Dating : création de threads privés par paires, alerte -1 min, suppression/archivage fin, rapport embed
-# - Commandes claires : /rencontre_help /rencontre_info /rencontre_stats /setcooldown /owners /rencontreban /speeddating
-# - Aucune pollution de logs lors des leaves (nettoyage silencieux)
+# - Speed Dating : paires en threads privés, alerte -1min, suppression/archivage fin, rapport embed
+# - Commandes : /rencontre_help /rencontre_info /rencontre_stats /setcooldown /owners /rencontreban /speeddating
+# - Aucun spam de leaves (nettoyage silencieux)
 #
 # Dépendances : discord.py 2.4+ (pip install -U discord.py)
-# Variables d’environnement requises : DISCORD_TOKEN, GUILD_ID, ROLE_ACCESS, CH_GIRLS, CH_BOYS, CH_SPEED, CH_LOGS, CH_WELCOME
+# Vars d’env : DISCORD_TOKEN, GUILD_ID, ROLE_ACCESS, CH_GIRLS, CH_BOYS, CH_SPEED, CH_LOGS, CH_WELCOME
 # ================================================================
 
 import os, re, json, asyncio, time, random
@@ -298,8 +298,11 @@ class ContactModal(discord.ui.Modal, title="💌 Premier message"):
         try:
             dm = await target.create_dm()
             txt = (
-                f"💌 **{author.display_name}** souhaite te parler !\n"
-                f"🗨️ “{content}”\n\n"
+                f"💌 **{author.display_name}** souhaite te parler !
+"
+                f"🗨️ “{content}”
+
+"
                 f"❤️ Tu peux répondre directement à ce message."
             )
             await dm.send(txt)
@@ -313,7 +316,8 @@ class ContactModal(discord.ui.Modal, title="💌 Premier message"):
             await send_log_embed(
                 guild,
                 "Contact envoyé",
-                f"👤 {author.mention} → <@{self.target_id}>\n✉️ “{excerpt}”",
+                f"👤 {author.mention} → <@{self.target_id}>
+✉️ “{excerpt}”",
                 user=author,
                 color=0x3B82F6
             )
@@ -364,10 +368,8 @@ class ProfileView(discord.ui.View):
     async def contact(self, inter: discord.Interaction, btn: discord.ui.Button):
         if inter.user.id == self.owner_id:
             await inter.response.send_message("🙃 Pas toi-même.", ephemeral=True); return
-        # Cooldown contact
         if not self._check_cd(contact_cooldowns, inter.user.id, int(storage.data.get("contact_cooldown", CONTACT_COOLDOWN))):
             await inter.response.send_message("⏳ Attends un peu avant d’envoyer un nouveau message 💌", ephemeral=True); return
-        # Ouvre le modal
         await inter.response.send_modal(ContactModal(target_id=self.owner_id))
 
     @discord.ui.button(emoji="🗑️", style=discord.ButtonStyle.danger, custom_id="profile_delete")
@@ -433,9 +435,15 @@ async def ensure_welcome_panel(bot: commands.Bot):
     embed = discord.Embed(
         title="🌙 Bienvenue dans **Miri Rencontre**",
         description=(
-            "✨ **Découvre, partage, connecte.**\n\n"
-            "Crée ton profil pour rencontrer de nouvelles personnes, liker, échanger et participer aux **soirées rencontre** 🥂\n\n"
-            "⚠️ Réservé aux **18 ans et plus**.\n\n"
+            "✨ **Découvre, partage, connecte.**
+
+"
+            "Crée ton profil pour rencontrer de nouvelles personnes, liker, échanger et participer aux **soirées rencontre** 🥂
+
+"
+            "⚠️ Réservé aux **18 ans et plus**.
+
+"
             "> 🌹 Clique sur le bouton ci-dessous pour commencer."
         ),
         color=discord.Color.dark_purple()
@@ -464,16 +472,20 @@ async def send_speed_report_embed(
     if not isinstance(ch, discord.TextChannel): return
     e = discord.Embed(
         title="🕊️ Rapport — Soirée Speed Dating",
-        description=f"**Organisateur :** {organizer.mention}\n"
-                    f"**Durée :** {duration_str}\n"
+        description=f"**Organisateur :** {organizer.mention}
+"
+                    f"**Durée :** {duration_str}
+"
                     f"**Threads créés :** {len(created_threads)}",
         color=discord.Color.purple(),
         timestamp=datetime.now(timezone.utc),
     )
-    e.add_field(name="🕒 Horaires", value=f"Début : {started_at.strftime('%d/%m/%Y %H:%M')}\nFin : {closed_at.strftime('%d/%m/%Y %H:%M')}", inline=False)
+    e.add_field(name="🕒 Horaires", value=f"Début : {started_at.strftime('%d/%m/%Y %H:%M')}
+Fin : {closed_at.strftime('%d/%m/%Y %H:%M')}", inline=False)
     if created_threads:
         lines = [f"• [{th.name}](https://discord.com/channels/{guild.id}/{th.id})" for th in created_threads[:10]]
-        e.add_field(name="💬 Conversations", value="\n".join(lines), inline=False)
+        e.add_field(name="💬 Conversations", value="
+".join(lines), inline=False)
         if len(created_threads) > 10:
             e.add_field(name="…", value=f"+{len(created_threads)-10} threads supplémentaires", inline=False)
     e.set_footer(text="Miri Rencontre • Journal des événements")
@@ -513,8 +525,11 @@ class AdminCog(commands.Cog, name="Admin"):
         published = len(storage.data.get("profile_msgs", {}))
         bans = len(storage.data.get("banned_users", []))
         e = discord.Embed(title="📊 Statistiques — Miri Rencontre", description="Aperçu global 💞", color=BRAND_COLOR, timestamp=datetime.now(timezone.utc))
-        e.add_field(name="👥 Profils", value=f"• Total : **{total}**\n• Publiés : **{published}**\n• Bannis : **{bans}**", inline=False)
-        e.add_field(name="⚙️ Paramètres", value=f"• ❤️ Like : **{storage.data.get('like_cooldown', LIKE_COOLDOWN)//60} min**\n• 💌 Contact : **{storage.data.get('contact_cooldown', CONTACT_COOLDOWN)//60} min**", inline=False)
+        e.add_field(name="👥 Profils", value=f"• Total : **{total}**
+• Publiés : **{published}**
+• Bannis : **{bans}**", inline=False)
+        e.add_field(name="⚙️ Paramètres", value=f"• ❤️ Like : **{storage.data.get('like_cooldown', LIKE_COOLDOWN)//60} min**
+• 💌 Contact : **{storage.data.get('contact_cooldown', CONTACT_COOLDOWN)//60} min**", inline=False)
         e.set_footer(text="Miri Rencontre • Dashboard Admin")
         await inter.response.send_message(embed=e, ephemeral=True)
 
@@ -640,7 +655,8 @@ class AdminCog(commands.Cog, name="Admin"):
                 )
                 await th.add_user(a); await th.add_user(b)
                 await th.send(
-                    f"Bienvenue {a.mention} et {b.mention} — vous avez **{nice_duration}** ⏳.\n"
+                    f"Bienvenue {a.mention} et {b.mention} — vous avez **{nice_duration}** ⏳.
+"
                     f"Soyez respectueux·ses. Le fil sera **clôturé** à la fin."
                 )
                 created_threads.append(th)
@@ -686,16 +702,22 @@ class HelpCog(commands.Cog, name="Aide"):
         )
         e.add_field(
             name="👤 Utilisateurs",
-            value="• Bouton **✨ Créer mon profil** dans le panneau d’accueil\n• Interagir avec les profils via ❤️ / ❌ / 📩 / 🗑️\n• `/rencontre_info` — infos publiques",
+            value="• Bouton **✨ Créer mon profil** dans le panneau d’accueil
+• Interagir avec les profils via ❤️ / ❌ / 📩 / 🗑️
+• `/rencontre_info` — infos publiques",
             inline=False
         )
         e.add_field(
             name="🛠️ Admins",
             value=(
-                "• `/speeddating participants:<mentions> couples:<n> duree:<ex 30m> nom:<txt> delete_after:<bool>`\n"
-                "• `/setcooldown like|contact <minutes>`\n"
-                "• `/rencontre_stats`\n"
-                "• `/rencontreban add/remove/list`\n"
+                "• `/speeddating participants:<mentions> couples:<n> duree:<ex 30m> nom:<txt> delete_after:<bool>`
+"
+                "• `/setcooldown like|contact <minutes>`
+"
+                "• `/rencontre_stats`
+"
+                "• `/rencontreban add/remove/list`
+"
                 "• `/owners add/remove/list`"
             ),
             inline=False
@@ -717,7 +739,9 @@ class PublicInfoCog(commands.Cog, name="Infos"):
             color=BRAND_COLOR,
             timestamp=datetime.now(timezone.utc),
         )
-        e.add_field(name="💬 Activité", value=f"• Profils enregistrés : **{total}**\n• Profils publiés : **{published}**\n• Taux d’activité : **{percent}%**", inline=False)
+        e.add_field(name="💬 Activité", value=f"• Profils enregistrés : **{total}**
+• Profils publiés : **{published}**
+• Taux d’activité : **{percent}%**", inline=False)
         e.add_field(name="🕊️ Modération", value="Respect & bienveillance 🛡️", inline=False)
         e.set_footer(text="Miri Rencontre • Ensemble, ça matche ✨")
         await inter.response.send_message(embed=e, ephemeral=False)

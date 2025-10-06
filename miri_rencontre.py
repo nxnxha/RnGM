@@ -1,11 +1,11 @@
 # ================================================================
-# 🌹 MIRI RENCONTRE — BOT DISCORD COMPLET (Reply + Slash + Logs)
+# 🌹 MIRI RENCONTRE — BOT DISCORD COMPLET (Final)
 # ================================================================
 # Dépendances : discord.py >= 2.4  →  pip install -U discord.py
-# Vars d’env obligatoires :
+# Variables d’environnement indispensables :
 #   DISCORD_TOKEN
-#   GUILD_ID          (par défaut 1382730341944397967)
-# Recommandées (IDs de salons/rôle) :
+#   GUILD_ID          (défaut 1382730341944397967)
+# Recommandées (IDs salons/rôle) :
 #   ROLE_ACCESS, CH_GIRLS, CH_BOYS, CH_SPEED, CH_LOGS, CH_WELCOME
 # ================================================================
 
@@ -316,62 +316,6 @@ class ContactModal(discord.ui.Modal, title="💌 Premier message"):
         else:
             await inter.response.send_message("⚠️ Impossible d’envoyer le DM (DM fermés ?).", ephemeral=True)
 
-# --------- Modal de RÉPONSE ---------
-class ReplyModal(discord.ui.Modal, title="💬 Répondre en DM"):
-    def __init__(self, target_id: int):
-        super().__init__(timeout=300)
-        self.target_id = target_id
-        self.message = discord.ui.TextInput(
-            label="Ta réponse (max 400 caractères)",
-            style=discord.TextStyle.paragraph,
-            max_length=400,
-            required=True,
-            placeholder="Reste respectueux et clair ✨"
-        )
-        self.add_item(self.message)
-
-    async def on_submit(self, inter: discord.Interaction):
-        author = inter.user
-        guild = inter.guild
-        if not guild:
-            await inter.response.send_message("⚠️ Utilisable sur le serveur.", ephemeral=True)
-            return
-        target = guild.get_member(self.target_id)
-        if not target:
-            await inter.response.send_message("⚠️ Destinataire introuvable.", ephemeral=True)
-            return
-
-        content = self.message.value.strip()
-        if not content:
-            await inter.response.send_message("⚠️ Message vide.", ephemeral=True)
-            return
-
-        ok = False
-        try:
-            dm = await target.create_dm()
-            txt = (
-                f"💬 **Réponse de {author.display_name}**\n"
-                f"🗨️ « {content} »\n"
-                f"📎 (tu peux répondre à ce message)"
-            )
-            await dm.send(txt)
-            ok = True
-        except Exception:
-            ok = False
-
-        if ok:
-            await inter.response.send_message("🔁 Réponse envoyée ✔️", ephemeral=True)
-            excerpt = (content[:180] + "…") if len(content) > 180 else content
-            await send_log_embed(
-                guild,
-                "Réponse envoyée",
-                f"🔁 {author.mention} → <@{self.target_id}>\n✉️ “{excerpt}”",
-                user=author,
-                color=0x22C55E
-            )
-        else:
-            await inter.response.send_message("⚠️ DM non envoyé (DM fermés ?).", ephemeral=True)
-
 # --------- View de profil (boutons emoji-only persistants) ---------
 class ProfileView(discord.ui.View):
     def __init__(self, owner_id: int):
@@ -558,7 +502,8 @@ async def send_speed_report_embed(
         pass
 
 # ================================================================
-# COGS & COMMANDES
+# COGS & COMMANDES (sans décorateur guild pour éviter le bug enfant)
+#   → lier à la guilde via self.tree.sync(guild=GUILD_OBJ) dans on_ready
 # ================================================================
 class AdminCog(commands.Cog, name="Admin"):
     def __init__(self, bot: commands.Bot):
@@ -566,7 +511,6 @@ class AdminCog(commands.Cog, name="Admin"):
 
     # -------- Sync (admin) --------
     @app_commands.command(name="sync", description="Resynchroniser les commandes slash du bot (admin)")
-    @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(administrator=True)
     async def sync_cmds(self, inter: discord.Interaction):
         cmds = await inter.client.tree.sync(guild=inter.guild)
@@ -574,7 +518,6 @@ class AdminCog(commands.Cog, name="Admin"):
 
     # -------- Cooldowns --------
     @app_commands.command(name="setcooldown", description="Modifier le cooldown des interactions (admin)")
-    @app_commands.guilds(GUILD_OBJ)
     @app_commands.describe(type="like ou contact", minutes="durée en minutes (min 1)")
     @app_commands.checks.has_permissions(administrator=True)
     async def setcooldown(self, inter: discord.Interaction, type: str, minutes: int):
@@ -595,7 +538,6 @@ class AdminCog(commands.Cog, name="Admin"):
 
     # -------- Stats (admin) --------
     @app_commands.command(name="rencontre_stats", description="📊 Statistiques de l’Espace Rencontre (admin)")
-    @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(administrator=True)
     async def rencontre_stats(self, inter: discord.Interaction):
         total = len(storage.data.get("profiles", {}))
@@ -607,24 +549,17 @@ class AdminCog(commands.Cog, name="Admin"):
             color=BRAND_COLOR,
             timestamp=datetime.now(timezone.utc)
         )
-        e.add_field(
-            name="👥 Profils",
-            value=f"• Total : **{total}**\n• Publiés : **{published}**\n• Bannis : **{bans}**",
-            inline=False
-        )
-        e.add_field(
-            name="⚙️ Paramètres",
-            value=f"• ❤️ Like : **{storage.data.get('like_cooldown', LIKE_COOLDOWN)//60} min**\n• 💌 Contact : **{storage.data.get('contact_cooldown', CONTACT_COOLDOWN)//60} min**",
-            inline=False
-        )
+        e.add_field(name="👥 Profils", value=f"• Total : **{total}**\n• Publiés : **{published}**\n• Bannis : **{bans}**", inline=False)
+        e.add_field(name="⚙️ Paramètres", value=f"• ❤️ Like : **{storage.data.get('like_cooldown', LIKE_COOLDOWN)//60} min**\n• 💌 Contact : **{storage.data.get('contact_cooldown', CONTACT_COOLDOWN)//60} min**", inline=False)
         e.set_footer(text="Miri Rencontre • Dashboard Admin")
         await inter.response.send_message(embed=e, ephemeral=True)
 
-    # -------- Rencontre BAN --------
+    # -------- Groupes BAN & OWNERS --------
     ban_group = app_commands.Group(name="rencontreban", description="Gérer l'accès Rencontre (admin)")
+    owners_group = app_commands.Group(name="owners", description="Gérer les propriétaires du bot")
 
+    # ---- BAN ----
     @ban_group.command(name="add", description="🚫 Bannir un membre de la Rencontre")
-    @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(administrator=True)
     async def ban_add(self, inter: discord.Interaction, user: discord.Member, raison: Optional[str] = None):
         await storage.ban(user.id)
@@ -632,14 +567,12 @@ class AdminCog(commands.Cog, name="Admin"):
         await inter.response.send_message(f"🚫 **{user.display_name}** banni de la Rencontre.", ephemeral=True)
 
     @ban_group.command(name="remove", description="✅ Débannir un membre")
-    @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(administrator=True)
     async def ban_remove(self, inter: discord.Interaction, user: discord.Member):
         await storage.unban(user.id)
         await inter.response.send_message(f"✅ **{user.display_name}** débanni.", ephemeral=True)
 
     @ban_group.command(name="list", description="Voir la liste des bannis")
-    @app_commands.guilds(GUILD_OBJ)
     async def ban_list(self, inter: discord.Interaction):
         ids = storage.list_bans()
         if not ids:
@@ -651,25 +584,20 @@ class AdminCog(commands.Cog, name="Admin"):
             names.append(m.mention if m else f"`{i}`")
         await inter.response.send_message("**Bannis Rencontre :** " + ", ".join(names), ephemeral=True)
 
-    # -------- Owners --------
-    owners_group = app_commands.Group(name="owners", description="Gérer les propriétaires du bot")
-
+    # ---- OWNERS ----
     @owners_group.command(name="add", description="Ajouter un owner (admin)")
-    @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(administrator=True)
     async def owners_add(self, inter: discord.Interaction, user: discord.Member):
         await storage.add_owner(user.id)
         await inter.response.send_message(f"✅ **{user.display_name}** ajouté comme owner.", ephemeral=True)
 
     @owners_group.command(name="remove", description="Retirer un owner (admin)")
-    @app_commands.guilds(GUILD_OBJ)
     @app_commands.checks.has_permissions(administrator=True)
     async def owners_remove(self, inter: discord.Interaction, user: discord.Member):
         await storage.remove_owner(user.id)
         await inter.response.send_message(f"🗑️ **{user.display_name}** retiré des owners.", ephemeral=True)
 
     @owners_group.command(name="list", description="Lister les owners")
-    @app_commands.guilds(GUILD_OBJ)
     async def owners_list(self, inter: discord.Interaction):
         ids = storage.data.get("owners", [])
         if not ids:
@@ -681,12 +609,72 @@ class AdminCog(commands.Cog, name="Admin"):
             mentions.append(m.mention if m else f"`{i}`")
         await inter.response.send_message("**Owners :** " + ", ".join(mentions), ephemeral=True)
 
-    # -------- SpeedDating --------
+# -------- Aide (slash) --------
+class HelpCog(commands.Cog, name="Aide"):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    @app_commands.command(name="rencontre_help", description="Affiche l’aide du bot Rencontre")
+    async def rencontre_help(self, inter: discord.Interaction):
+        user_help = (
+            "• Panneau d’accueil → **✨ Créer mon profil**\n"
+            "• Sur un profil : ❤️ / ❌ / 📩 / 🗑️\n"
+            "• `/rencontre_info` — infos publiques"
+        )
+        admin_help = (
+            "• `/speeddating participants:<mentions> couples:<n> duree:<30m> nom:<txt> delete_after:<bool>`\n"
+            "• `/speeddating_list` / `/speeddating_stop` / `/speeddating_report`\n"
+            "• `/setcooldown like|contact <minutes>`\n"
+            "• `/rencontre_stats`\n"
+            "• `/rencontreban add/remove/list`\n"
+            "• `/owners add/remove/list`\n"
+            "• `/sync`"
+        )
+        e = discord.Embed(
+            title="🌹 Aide — Miri Rencontre",
+            description="Commandes principales et rôles requis.",
+            color=BRAND_COLOR,
+            timestamp=datetime.now(timezone.utc),
+        )
+        e.add_field(name="👤 Utilisateurs", value=user_help, inline=False)
+        e.add_field(name="🛠️ Admins", value=admin_help, inline=False)
+        e.set_footer(text="Miri Rencontre • Laissez la magie opérer ✨")
+        await inter.response.send_message(embed=e, ephemeral=True)
+
+# -------- Infos publiques --------
+class PublicInfoCog(commands.Cog, name="Infos"):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    @app_commands.command(name="rencontre_info", description="📖 Infos publiques de l’Espace Rencontre")
+    async def rencontre_info(self, inter: discord.Interaction):
+        total = len(storage.data.get("profiles", {}))
+        published = len(storage.data.get("profile_msgs", {}))
+        percent = round((published / total) * 100, 1) if total else 0
+        e = discord.Embed(
+            title="🌹 Miri Rencontre — Informations",
+            description="✨ L’Espace Rencontre est ouvert à ceux qui cherchent de vraies connexions 💞",
+            color=BRAND_COLOR,
+            timestamp=datetime.now(timezone.utc),
+        )
+        e.add_field(
+            name="💬 Activité",
+            value=f"• Profils enregistrés : **{total}**\n• Profils publiés : **{published}**\n• Taux d’activité : **{percent}%**",
+            inline=False
+        )
+        e.add_field(name="🕊️ Modération", value="Respect & bienveillance 🛡️", inline=False)
+        e.set_footer(text="Miri Rencontre • Ensemble, ça matche ✨")
+        await inter.response.send_message(embed=e, ephemeral=False)
+
+# -------- SpeedDating (création / list / stop / report) --------
+class SpeedCog(commands.Cog, name="Speed"):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
     @app_commands.command(
         name="speeddating",
         description="Créer des threads privés pour une soirée (participants via mentions)."
     )
-    @app_commands.guilds(GUILD_OBJ)
     @app_commands.describe(
         participants="Mentionne les participants (ex: @a @b @c …)",
         couples="Nombre maximum de couples (paires)",
@@ -762,7 +750,6 @@ class AdminCog(commands.Cog, name="Admin"):
             except Exception:
                 continue
 
-        # sauvegarde session
         storage.data["speed_sessions"][session_id] = {
             "threads": [t.id for t in created_threads],
             "name": nom or "Speed ⏳",
@@ -789,7 +776,6 @@ class AdminCog(commands.Cog, name="Admin"):
             await asyncio.sleep(total_seconds)
 
         closed_at = datetime.now(TZ)
-        # clôture
         for th in created_threads:
             try:
                 if delete_after:
@@ -802,7 +788,6 @@ class AdminCog(commands.Cog, name="Admin"):
         await send_speed_report_embed(inter.guild, inter.user, ndur, created_threads, started_at, closed_at)
 
     @app_commands.command(name="speeddating_list", description="Lister les sessions SpeedDating actives/connues")
-    @app_commands.guilds(GUILD_OBJ)
     async def speeddating_list(self, inter: discord.Interaction):
         sessions = storage.data.get("speed_sessions", {})
         if not sessions:
@@ -816,7 +801,6 @@ class AdminCog(commands.Cog, name="Admin"):
         await inter.response.send_message(embed=e, ephemeral=True)
 
     @app_commands.command(name="speeddating_stop", description="Clôturer une session : archiver/verrouiller ou supprimer")
-    @app_commands.guilds(GUILD_OBJ)
     @app_commands.describe(session_id="ID de session", delete="True: supprimer les threads, False: archiver/locker")
     @app_commands.checks.has_permissions(manage_channels=True)
     async def speeddating_stop(self, inter: discord.Interaction, session_id: str, delete: bool = True):
@@ -842,14 +826,12 @@ class AdminCog(commands.Cog, name="Admin"):
         await inter.response.send_message(f"✅ Session `{session_id}` clôturée ({done} threads).", ephemeral=True)
 
     @app_commands.command(name="speeddating_report", description="Forcer l’envoi d’un rapport (dernière session)")
-    @app_commands.guilds(GUILD_OBJ)
     async def speeddating_report(self, inter: discord.Interaction, session_id: Optional[str] = None):
         sessions = storage.data.get("speed_sessions", {})
         if not sessions:
             await inter.response.send_message("Aucune session en mémoire.", ephemeral=True)
             return
         if not session_id:
-            # prend la plus récente
             session_id = sorted(sessions.keys())[-1]
         s = sessions.get(session_id)
         if not s:
@@ -868,77 +850,6 @@ class AdminCog(commands.Cog, name="Admin"):
         await send_speed_report_embed(inter.guild, inter.user, "?", threads, started_at, datetime.now(TZ))
         await inter.response.send_message("📨 Rapport envoyé.", ephemeral=True)
 
-# -------- Aide (slash) --------
-class HelpCog(commands.Cog, name="Aide"):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-
-    @app_commands.command(name="rencontre_help", description="Affiche l’aide du bot Rencontre")
-    @app_commands.guilds(GUILD_OBJ)
-    async def rencontre_help(self, inter: discord.Interaction):
-        user_help = (
-            "• Panneau d’accueil → **✨ Créer mon profil**\n"
-            "• Sur un profil : ❤️ / ❌ / 📩 / 🗑️\n"
-            "• `/rencontre_info` — infos publiques\n"
-            "• `/reply` — répondre en DM via modal"
-        )
-        admin_help = (
-            "• `/speeddating participants:<mentions> couples:<n> duree:<30m> nom:<txt> delete_after:<bool>`\n"
-            "• `/speeddating_list` / `/speeddating_stop` / `/speeddating_report`\n"
-            "• `/setcooldown like|contact <minutes>`\n"
-            "• `/rencontre_stats`\n"
-            "• `/rencontreban add/remove/list`\n"
-            "• `/owners add/remove/list`\n"
-            "• `/sync`"
-        )
-        e = discord.Embed(
-            title="🌹 Aide — Miri Rencontre",
-            description="Commandes principales et rôles requis.",
-            color=BRAND_COLOR,
-            timestamp=datetime.now(timezone.utc),
-        )
-        e.add_field(name="👤 Utilisateurs", value=user_help, inline=False)
-        e.add_field(name="🛠️ Admins", value=admin_help, inline=False)
-        e.set_footer(text="Miri Rencontre • Laissez la magie opérer ✨")
-        await inter.response.send_message(embed=e, ephemeral=True)
-
-# -------- Infos publiques --------
-class PublicInfoCog(commands.Cog, name="Infos"):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-
-    @app_commands.command(name="rencontre_info", description="📖 Infos publiques de l’Espace Rencontre")
-    @app_commands.guilds(GUILD_OBJ)
-    async def rencontre_info(self, inter: discord.Interaction):
-        total = len(storage.data.get("profiles", {}))
-        published = len(storage.data.get("profile_msgs", {}))
-        percent = round((published / total) * 100, 1) if total else 0
-        e = discord.Embed(
-            title="🌹 Miri Rencontre — Informations",
-            description="✨ L’Espace Rencontre est ouvert à ceux qui cherchent de vraies connexions 💞",
-            color=BRAND_COLOR,
-            timestamp=datetime.now(timezone.utc),
-        )
-        e.add_field(
-            name="💬 Activité",
-            value=f"• Profils enregistrés : **{total}**\n• Profils publiés : **{published}**\n• Taux d’activité : **{percent}%**",
-            inline=False
-        )
-        e.add_field(name="🕊️ Modération", value="Respect & bienveillance 🛡️", inline=False)
-        e.set_footer(text="Miri Rencontre • Ensemble, ça matche ✨")
-        await inter.response.send_message(embed=e, ephemeral=False)
-
-# -------- Répondre en DM via MODAL (slash) --------
-class ReplyCog(commands.Cog, name="Reply"):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-
-    @app_commands.command(name="reply", description="Ouvrir un modal pour répondre en DM à un membre")
-    @app_commands.guilds(GUILD_OBJ)
-    @app_commands.describe(user="Destinataire de la réponse")
-    async def reply(self, inter: discord.Interaction, user: discord.Member):
-        await inter.response.send_modal(ReplyModal(target_id=user.id))
-
 # ================================================================
 # BOT PRINCIPAL
 # ================================================================
@@ -951,19 +862,21 @@ class RencontreBot(commands.Bot):
         await self.add_cog(AdminCog(self))
         await self.add_cog(HelpCog(self))
         await self.add_cog(PublicInfoCog(self))
-        await self.add_cog(ReplyCog(self))
-        # Views persistantes (custom_id fixés + timeout=None)
+        await self.add_cog(SpeedCog(self))
+        # Views persistantes
         self.add_view(ProfileView(owner_id=0))
         self.add_view(StartView())
 
     async def on_ready(self):
         if not self.synced:
             try:
+                # Synchro GUILD-ONLY → évite l’erreur “child commands … default guilds”
                 await self.tree.sync(guild=GUILD_OBJ)
                 self.synced = True
-                print(f"[SYNC] Commandes guild synchronisées ({GUILD_ID})")
+                print(f"[SYNC] Commandes guild synchronisées ({GUILD_ID}) ✅")
             except Exception as e:
                 print(f"[SYNC FAIL] {e}")
+
         print(f"✅ Connecté comme {self.user} (id={self.user.id})")
         await self.change_presence(status=discord.Status.online, activity=discord.Game("Miri Rencontre 🌹"))
         await ensure_welcome_panel(self)
